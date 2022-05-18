@@ -1,0 +1,4947 @@
+#!/bin/bash
+
+# Some global configurations required in the code
+: ${WORKDIR:="$(readlink -e "$(dirname ${0})")"}
+: ${MONGODIR:="$(basename ${WORKDIR} | sed 's/-/_/g')"}
+: ${MONGOUSER:="mongod"}
+: ${MONGODBDEF:="$(hostname):27017"}
+: ${PY_PRETTY_JSON:="import json; import sys; print json.dumps (json.loads (sys.stdin.read ()), sort_keys = True, indent = 2);"}
+: ${DATE_ISO_8601:="%Y-%m-%dT%H:%M:%S.000+0000"}
+: ${TRACE:="false"}
+: ${FAIL_ACTION:="exit"}
+: ${RET_VALUE:="0"}
+: ${GLOBAL_MEDIA_PATH:="/srv/meduse"}
+# test that use authentication must set the "-u user -p pass" string that correspond to the db user password of that test
+: ${MONGODUMP_USER_PASS:=""}
+
+export WORKDIR
+export MONGODIR
+export MONGOUSER
+export MONGODB_URL
+export GLOBAL_MEDIA_PATH
+
+# to avoid getting a "," for number bigger than 999
+export LC_CTYPE="C"
+export LC_NUMERIC="C"
+
+
+gInstanceRestarted=false
+
+# Add sbin to PATH for some root utilities
+export PATH="${PATH}:/sbin:/usr/sbin:/usr/local/sbin"
+
+# Default checksum file name for Centos
+CHECKSUM_FILE="checksum"
+
+OS="CentOS"
+grep -q "ID_LIKE=debian" /etc/os-release
+if [ $? -eq 0 ]; then
+    OS="Ubuntu"
+    CHECKSUM_FILE="checksum_ubuntu"
+fi
+
+
+function detect-gst-version ()
+{
+  logpush detect-gst-version 
+  
+  if [ "${OS}" == "Ubuntu" ]; 
+  then
+    export GST_VERSION="1.0"
+  fi
+
+  if [ -z "${GST_VERSION}" ];  
+  then
+    envrunfile=""
+    # CENTOS
+    if have-file ${HOME}/opt/dynamic/head/envrun
+    then
+      logmsg "Using development environment ${HOME}/opt/dynamic/head/envrun"
+      envrunfile="${HOME}/opt/dynamic/head/envrun"
+    elif have-file /opt/dynamic/head/envrun
+    then
+      logmsg "Using development environment from /opt/dynamic/head/envrun"
+      envrunfile="/opt/dynamic/head/envrun"
+    elif have-rpm spotxde-ltrx
+    then
+      logmsg "Using RPM environment : ${__find_rpm}"
+      logmsg "Getting envrun from /opt/vantrix/gstreamer/"
+      envrunfile="/opt/vantrix/gstreamer/envrun"
+    fi
+
+    if [ -z "${envrunfile}" ];
+    then
+      logmsg "Error no envrun file found"
+      exit -1
+    else
+      grep "GST_VERSION=\"0.10\"" ${envrunfile}
+      if [ "$?" -eq 0 ]; then
+        export GST_VERSION="0.10"
+      else
+        grep "GST_VERSION=\"1.0\"" ${envrunfile}
+        if [ "$?" -eq 0 ]; then
+          export GST_VERSION="1.0"
+        fi
+      fi
+    fi
+  fi
+
+  if [ "${GST_VERSION}" == "1.0" ]; then
+    export VIDEOCONVERT="videoconvert"
+    export TSMUX="vanmpegtsmux"
+    export TSDEMUX="vanmpegtsdemux"
+    export X264ENC="vanx264enc"
+    export VALGRIND_EXE="valgrind"
+  elif [ "${GST_VERSION}" == "0.10" ]; then
+    export VIDEOCONVERT="ffmpegcolorspace"
+    export TSMUX="mpegtsmux"
+    export TSDEMUX="mpegtsdemux"
+    export X264ENC="x264"
+    export VALGRIND_EXE="vangrind"
+  else
+    logmsg "ERROR no GST_VERSION found"
+    exit -1
+  fi
+
+  logpop
+}
+
+
+
+# Return the usable mongo db address from existing value or automatic configuration
+function getMongoAddr ()
+{
+  if [ ! -z "${MONGODB_URL}" ]
+  then
+    echo "${MONGODB_URL}"
+    return 0
+  fi
+
+  # Query mongo for the current master in a replica set
+  local res=$(mongo --quiet --eval "db.isMaster()['primary']" 2>/dev/null)
+  [ -z "${res}" ] && res=${MONGODBDEF}
+
+  if [ "${OS}" == "Ubuntu" ]; then
+    logmsg "ubuntu using localhost:27017 for mongo"
+    res="localhost:27017"
+  fi
+
+  echo -e "${res}/${MONGODIR}"
+}
+
+function trace ()
+{
+  ${TRACE} && logmsg "${@}"
+}
+
+function pud ()
+{
+  logpush pud
+  have-file-or-fail "${1}"
+  check builtin pushd "${1}"
+  trace pud "${1}"
+  logpop
+}
+
+function pod ()
+{
+  logpush pod
+  check builtin popd
+  trace pod
+  logpop
+}
+
+# Logger context stack push - Use at the begining of a function that uses the log
+function logpush ()
+{
+  : ${__logheight:=0}
+
+  let __logheight=${__logheight}+1
+
+  __logctx="${1}"
+  __logstack[__logheight]="${__logctx}"
+
+  export __logheight
+  export __logstack
+  export __logctx
+  trace logpush
+}
+
+# Logger context stack pop - Use at the end of a function that uses the log
+function logpop ()
+{
+  trace logpop
+  : ${__logheight:=1}
+
+  let __logheight=${__logheight}-1
+
+  ((__logheight >= 0)) && __logctx=${__logstack[__logheight]}
+
+  export __logheight
+  export __logctx
+  return ${RET_VALUE}
+}
+
+# Logger function for all test activity
+function logmsg ()
+{
+  : ${__logheight:=0}
+  : ${__timer_a:=$(date +%s)}
+  export __timer_a
+
+  __timer_b=$(date +%s)
+  local elapsed=$((__timer_b - __timer_a))
+
+  let a=${__logheight}
+  let b=23-${a}
+
+  printf "[%02d:%02d:%02d]%${a}s%-${b}s :%s\n" $((elapsed/3600)) $((elapsed/60%60)) $((elapsed%60)) "" "${__logctx}" " $(echo -e ${@})" 1>&2
+}
+
+# Log a message to stderr and exit with error code
+function failure ()
+{
+  logmsg "${@}" 1>&2
+
+  for ((n = __logheight - 1; n > 0; --n))
+  do
+    logmsg "called by ${__logstack[n]}"
+  done
+
+  [ ! -z "${__check_logger}" ] &&
+  [ -s "${__check_logger}" ] &&
+  cat ${__check_logger} 1>&2 &&
+  rm -f ${__check_logger}
+
+  export RET_VALUE=1
+  ${FAIL_ACTION} ${RET_VALUE}
+}
+
+# Run a command and check its status, log an error in case of failure
+# should be use for system function
+# DON'T use it on function that will call check or we loose error message
+function check ()
+{
+  trace check "${@}"
+  : ${__check_logger:=$(mktemp /tmp/logger-XXX)}
+  export __check_logger
+
+  "${@}" &> ${__check_logger} ||
+  failure "Error on ${@}"
+
+  rm -f ${__check_logger}
+  unset __check_logger
+
+  return ${RET_VALUE}
+}
+
+# run a command up to x time until it pass. Log error in case of failure
+function check-retry ()
+{
+   trace check-retry "${@}"
+
+   local orig_fail_action=${FAIL_ACTION}
+   # Disable exit on failure
+   export FAIL_ACTION=return
+
+   local num_retry="${1}"
+   shift
+
+   while ((num_retry>0));
+   do
+        export RET_VALUE=0
+        if [ ${num_retry} -eq 1 ]; then
+           # last chance. we set the original FAIL action
+           export FAIL_ACTION=${orig_fail_action}
+        fi
+        check "${@}"
+        let num_retry=${num_retry}-1
+        if [ ${RET_VALUE} -eq 0 ]; then
+           num_retry=0
+        else
+           logmsg "Retrying previous command in 5sec"
+           sleep 5
+        fi
+   done
+
+   export FAIL_ACTION=${orig_fail_action}
+
+   return ${RET_VALUE}
+}
+
+
+# Run a command and check its status, use normal pipes
+function check-fg ()
+{
+  trace check "${@}"
+  : ${__check_logger:=$(mktemp /tmp/logger-XXX)}
+  export __check_logger
+
+  "${@}" 2> ${__check_logger} ||
+  failure "Error on ${@}"
+
+  rm -f ${__check_logger}
+  unset __check_logger
+
+  return ${RET_VALUE}
+}
+
+function not-empty-or-fail ()
+{
+  local v="${1}"
+  shift
+
+  [ ! -z "${v}" ] ||
+  failure "${@}"
+}
+
+function test-log ()
+{
+  logpush test-log
+  logmsg "Entry"
+
+  if [ -z "${1}" ]
+  then
+
+    test-log "Hello"
+
+  else
+
+    logmsg "Received message : ${1}"
+    check false
+
+  fi
+
+  logmsg "Exit"
+  logpop
+}
+
+function is-su ()
+{
+   [ "${UID}" == "0" ]
+}
+
+# Queries which on ${1} to find executable in path
+function have-cmd ()
+{
+  which ${1} &> /dev/null
+}
+
+# Tests if ${1} exists (file or directory)
+function have-file ()
+{
+  [ ! -z "${1}" ] && [ -e "${1}" ]
+}
+
+# Checks if command is available in path or logs an error message
+function have-cmd-or-fail ()
+{
+  logpush have-cmd-or-fail
+  have-cmd ${1} ||
+  failure "Cannot find ${@}"
+  logpop
+}
+
+# Checks if file exists
+function have-file-or-fail ()
+{
+  logpush have-file-or-fail
+  have-file ${1} ||
+  failure "Cannot find ${@}"
+  logpop
+}
+
+function wait-for-minute ()
+{
+
+  while true
+  do
+
+    let cur=$(echo -e "60-$(date +%s)%60" | bc)
+
+    if [ -z "${cur}" ] || [ "${cur}" -le "1" ]
+    then
+
+      break
+
+    fi
+
+    sleep 1
+
+  done
+
+}
+
+# Waits for a specified time showing count down and not throwing any exception upon completion# ${1} file name
+# ${1} timeout in sec
+function wait-for-time ()
+{
+  logpush wait-for-time
+
+  not-empty-or-fail "${1}" "Usage : wait-for-time <timeout>"
+
+  let b=${1}
+  let d=${1}
+
+  while ((d>0))
+  do
+
+    if ((d>0))
+    then
+      logmsg "Waiting for ${1} seconds (timeout in ${d} sec)"
+      sleep 1
+      let d=${d}-1
+    fi
+  done
+
+  logpop
+  return 0
+}
+
+# Waits for a file to come up
+# ${1} file name
+# ${2} timeout in sec
+# ${3} (optionnal) (true or false) : wait for file to be released (default = true)
+function wait-for-file ()
+{
+  logpush wait-for-file
+
+  not-empty-or-fail "${2}" "Usage : wait-for-file <file> <timeout>"
+
+  let b=${2}
+  let d=${2}
+  local release=${3}
+
+  while ! ( have-file "${1}" || have-file "${1}.tmp" )
+  do
+
+    if ((d<=0))
+    then
+      logpop
+      failure "Timeout occured while waiting for ${1}"
+      return 1
+    else
+      logmsg "Waiting for ${1} (timeout ${d} sec)"
+      sleep 1
+      let d=${d}-1
+    fi
+  done
+
+  let d=${2}
+  if [ -z ${release} ] || [ ${release} != "false" ]; then
+  while ( ( have-file "${1}" && fuser -s "${1}" ) || ( have-file "${1}.tmp" && fuser -s "${1}.tmp" ) )
+  do
+    if ((d<=0))
+    then
+      logpop
+      failure "Timeout occured while waiting for ${1}"
+      return 1
+    else
+      logmsg "Waiting for process to stop using ${1} (timeout ${d}0 sec)"
+      sleep 10
+      let d=${d}-1
+    fi
+  done
+  fi
+
+  logpop
+  return 0
+}
+
+function file-larger-than ()
+{
+  logpush file-larger-than
+
+  not-empty-or-fail "${2}" "Usage : file-larger-than <file> <size>"
+  have-file-or-fail "${1}"
+
+  let a=$(stat -c %s "${1}")
+  let b=${2}
+
+  if ((a<=b))
+  then
+
+    failure "File ${1} of ${a} bytes is not larger than ${b}"
+
+  fi
+
+  logpop
+}
+
+function file-smaller-equal ()
+{
+  logpush file-smaller-equal
+
+  not-empty-or-fail "${2}" "Usage : file-smaller-equal <file> <size>"
+  have-file-or-fail "${1}"
+
+  let a=$(stat -c %s "${1}")
+  let b=${2}
+
+  if ((a>b))
+  then
+
+    failure "File ${1} of ${a} bytes is not smaller equal than ${b}"
+
+  fi
+
+  logpop
+}
+
+function validate-filter-param ()
+{
+   logpush validate-filter-param
+
+   not-empty-or-fail "${4}" "Usage : validate-filter-param <session.xml> <filter_name> <property_name> <expected_value>"
+   have-file-or-fail "${1}"
+
+   local session_xml=${1}
+   local filter=${2}
+   local prop=${3}
+   local expected=${4}
+
+   raw_value=`grep --max-count=1 -A 150  "<gst:type>${filter}" ${session_xml} | grep --max-count=1 -A 1 ${prop} | grep "gst:value" `
+   value="${raw_value#*>}"
+   value="${value%%<*}"
+   logmsg "searching for property \"${prop}\" expecting value of \"${expected}\""
+
+   if [ "${value}" != "${expected}" ]
+   then
+
+      failure "property ${prop} = ${value} expected = ${expected}"
+
+   fi
+
+   logpop
+}
+
+# Query debian database and filter packages by pattern in ${1}
+function find-deb ()
+{
+  export __find_deb=$(dpkg-query -l | grep -e "${1}")
+  [ ! -z "${__find_deb}" ] && echo -e "${__find_deb}"
+}
+
+function check-deb-not-running ()
+{
+  systemctl status ltrx &> /dev/null
+  local sys_status=${?}
+  if [ ${sys_status} -eq 0 ]; then
+    logmsg "Error : the .deb package is already running via systemctl"
+    ft-failure
+  fi
+}
+
+
+# Silently checks if find-deb matches something
+function have-deb ()
+{
+  find-deb "${1}" &> /dev/null
+}
+
+# Query rpm database and filter packages by pattern in ${1}
+function find-rpm ()
+{
+  export __find_rpm=$(rpm -qa | grep -e "^${1}")
+  [ ! -z "${__find_rpm}" ] && echo -e "${__find_rpm}"
+}
+
+# Silently checks if find-rpm matches something
+function have-rpm ()
+{
+  find-rpm "${1}" &> /dev/null
+}
+
+# Get a parameter from a config file in the "name = value" format
+function param-get ()
+{
+  logpush param-get
+  not-empty-or-fail "${2}" "Usage : param-get <file> <name>"
+  have-file-or-fail "${1}"
+  grep -e "^${2}.[ ,=]*" "${1}" | cut -d "=" -f 2 | sed -e "s|^.[ ]*||"
+  logpop
+}
+
+# Replace a parameter value if it is different
+function param-rep ()
+{
+  logpush param-rep
+  not-empty-or-fail "${2}" "Usage : param-rep <file> <key> [value]"
+  have-file-or-fail "${1}"
+
+  local old=$(param-get "${1}" "${2}")
+
+  if [ "${old}" != "${3}" ]
+  then
+    logmsg "Replacing parameter ${2} = ${old} with ${3} in ${1}"
+    check sed -e "s|^${2}.[ =]*.*|${2} = ${3}|g" -i "${1}"
+  fi
+  logpop
+}
+
+# Append a parameter at the end of a config file
+function param-add ()
+{
+  logpush param-add
+  not-empty-or-fail "${2}" "Usage : param-add <file> <key> [value]"
+  have-file-or-fail "${1}"
+
+  logmsg "Adding parameter ${2} = ${3} in ${1}"
+  check touch "${1}"
+  cat >> "${1}" << EOF
+
+# Added by param-add
+${2} = ${3}
+
+EOF
+  logpop
+}
+
+# Modify a configuration record in the format key = value for given file
+function param-set ()
+{
+  logpush param-add
+  not-empty-or-fail "${2}" "Usage : param-set <file> <key> [value]"
+  have-file-or-fail "${1}"
+
+  if grep -q -e "^${2}.[ =]*" "${1}"
+  then
+    param-rep "${@}"
+  else
+    param-add "${@}"
+  fi
+  logpop
+}
+
+function mongo-populate ()
+{
+  logpush mongo-populate
+
+  sed -e "s|^mongo |#mongo |g" -i config/mongo-populate
+  check config/mongo-populate
+
+  if [ "${OS}" == "Ubuntu" ]; then
+    logmsg "Ubuntu: bypassing check-retry since it fail (only do once). TODO: check if we still need this"
+    mongo $(getMongoAddr) config/mongo-populate.js
+  else
+    # there is some instability in automatic test. Retry 4 time the mongo command in case it fail
+    check-retry 4 timeout 30 mongo $(getMongoAddr) config/mongo-populate.js
+  fi  
+
+  logpop
+}
+
+function mongo-allow-non-root-user ()
+{
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  logpush mongo-allow-non-root-user
+
+  local user=${1}
+  not-empty-or-fail "${1}" "Usage : mongo-allow-non-root-user username"
+  logmsg "Allowing mongo to be run by user ${user}"
+
+  mongo-stop-all
+  chown -R ${user} /etc/mongod.conf.d
+  chown -R ${user} /var/lib/mongodb
+  chmod a+rx /var/lib/mongodb
+
+  logpop
+}
+
+
+# Translate an instance name into a config file
+function mongo-config ()
+{
+  logpush mongo-config
+  not-empty-or-fail "${1}" "Usage : mongo-config <instance>"
+  [ "${1:0:1}" == "/" ] && echo -e "${1}" || echo -e "/etc/mongod.conf.d/mongod-${1}.conf"
+  logpop
+}
+
+# Get a parameter from a mongo config file, automatically detects file or instance
+function mongo-param ()
+{
+  param-get "$(mongo-config "${1}")" "${2}"
+}
+
+function mongo-default-disable ()
+{
+
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  logpush mongo-default-disable
+
+  local target=$(find /etc -maxdepth 1 -type f -name "mongo*.conf" | head -n 1)
+
+  if [ ! -z "${target}" ] && have-file "${target}"
+  then
+
+    logmsg "Disable default config ${target}"
+
+    mongo-delete "${target}"
+
+    local ini=$(find /etc/init.d/ -name "mongo*" | head -n 1)
+    if [ -z "$ini" ]
+    then
+      logmsg "skipping chkconfig since nothing was found : find /etc/init.d/ -name \"mongo*\" "
+    else
+      check chmod -x ${ini}
+      check chkconfig $(basename ${ini}) off
+    fi
+  fi
+
+  logpop
+}
+
+# Install the mongodb server on a CentOS host
+function mongo-install ()
+{
+  logmsg "mongo-install is disabled since the script use an old version of mongodb not anymore supported."
+  return 1
+
+  # the following code should be update for mongodb 3.4.23. See Ltrx-132
+
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  logpush mongo-install
+
+  # Sanity check
+  logmsg "Basic validations"
+
+  have-cmd-or-fail rpm
+  have-cmd-or-fail yum
+
+  have-file-or-fail /etc/yum.repos.d
+
+  logmsg "Installation verification"
+
+  if ! have-rpm mongodb-org
+  then
+
+    logmsg "Will install MongoDB"
+
+    check touch /etc/yum.repos.d/mongodb.repo
+    cat > /etc/yum.repos.d/mongodb.repo << EOF
+[mongodb-org-2.6]
+name=MongoDB 2.6 Repository
+baseurl=http://downloads-distro.mongodb.org/repo/redhat/os/x86_64/
+gpgcheck=0
+enabled=1
+EOF
+
+    check yum install -y mongodb-org
+
+  else
+
+    logmsg "Using existing MongoDB"
+
+  fi
+
+  if ! have-cmd easy_install
+  then
+
+    logmsg "Will install python easy_install"
+    wget -q https://bitbucket.org/pypa/setuptools/raw/bootstrap/ez_setup.py -O - | python
+
+  fi
+
+  logmsg "Create certificate file for authentication support"
+  openssl rand -base64 741 > /etc/mongod.conf.d/mongodb-keyfile
+  chmod 600 /etc/mongod.conf.d/mongodb-keyfile
+
+  check easy_install -U pymongo
+  mongo-default-disable
+  mongo-delete-all
+  mongo-create-instance master
+  logpop
+}
+
+function mongo-pid ()
+{
+  logpush mongo-pid
+
+  local dbpid=$(mongo-param ${1} pidfilepath)
+  not-empty-or-fail "${dbpid}" "Error : Could not get pid - Missing parameter in ${1}"
+
+  if have-file "${dbpid}"
+  then
+    local pid=$(cat ${dbpid})
+    pgrep mongod | grep ${pid}
+  fi
+
+  logpop
+}
+
+function mongo-enable-authentication ()
+{
+   logpush mongo-enable-authentication
+   logmsg "Enable mongo authentication"
+   mongo-stop-all
+
+   for i in $(mongo-confs)
+   do
+      sed -c -i "s/\(.*\)keyFile\(.*\)/keyFile\2/" ${i}
+   done
+   sleep 5
+   mongo-start-all
+   logpop
+}
+
+function mongo-disable-authentication-ifenable ()
+{
+   logpush mongo-disable-authentication-ifenable
+
+   enabled=false
+   for i in $(mongo-confs)
+   do
+
+      grep --quiet "^keyFile" ${i} &&
+      enabled=true
+
+   done
+
+   ${enabled} && mongo-disable-authentication
+
+   logpop
+}
+
+function mongo-disable-authentication ()
+{
+   logpush mongo-disable-authentication
+   logmsg "Disable mongo authentication"
+   mongo-stop-all
+
+   for i in $(mongo-confs)
+   do
+      sed -c -i "s/\(.*\)keyFile\(.*\)/#keyFile\2/" ${i}
+   done
+
+   sleep 5
+   mongo-start-all
+
+   logpop
+}
+
+function mongo-start ()
+{
+  logpush mongo-start
+  not-empty-or-fail "${1}" "Usage : mongo-start <instance>"
+
+  # support for local install of mongod and running via systemctl. 
+  # for user that want local install for simple setup
+  local localmongo=$(systemctl is-active mongod)
+  if [ "$localmongo" = "active" ];
+  then
+    logmsg "Using mongo that is running via systemctl"
+  elif [ "$localmongo" = "inactive" ];
+  then
+    logmsg "local mongo is not running (please sudo systemctl start mongod)"
+    exit -1
+  elif [ "$localmongo" = "unknown" ];
+  then
+    local dbpath=$(mongo-param ${1} dbpath)
+    local dbpidf=$(dirname $(mongo-param ${1} pidfilepath))
+    local dblog=$(dirname $(mongo-param ${1} logpath))
+
+    for t in ${dbpath} ${dbpidf} ${dblog}
+    do
+
+      if ! have-file ${t}
+      then
+        check mkdir -p ${t}
+        check chown -R ${MONGOUSER}:${MONGOUSER} ${t}
+      fi
+
+    done
+
+    local dbpid=$(mongo-pid ${1})
+
+    if [ -z "${dbpid}" ]
+    then
+      logmsg "Start MongoDB $(basename ${1})"
+      check chmod a+rx /var/lib/mongodb
+      check chmod a+r  ${dbpidf} ${dblog}
+      BUILD_ID=dontKillMe check mongod -f "$(mongo-config ${1})"
+      gInstanceRestarted=true
+    fi
+  fi  
+
+  logpop
+}
+
+function mongo-stop ()
+{
+  logpush mongo-stop
+  not-empty-or-fail "${1}" "Usage : mongo-stop <config file>"
+
+  local dbpid=$(mongo-pid ${1})
+
+  if [ -z "${dbpid}" ]
+  then
+    logmsg "MongoDB instance $(basename ${1}) is not running"
+  else
+    logmsg "Stop MongoDB $(basename ${1})"
+    check mongod -f "$(mongo-config ${1})" --shutdown
+  fi
+
+  logpop
+}
+
+function mongo-confs ()
+{
+  if have-file /etc/mongod.conf.d/
+  then
+    find /etc/mongod.conf.d/ -name "*.conf" | sort
+  fi
+}
+
+function mongo-start-all ()
+{
+  logpush mongo-start-all
+
+  gInstanceRestarted=false
+  for i in $(mongo-confs)
+  do
+    mongo-start ${i}
+  done
+
+  # there is no reliable way I found to wait until mongo is ready AND a primary is elected
+  if ${gInstanceRestarted} && [ ! -z $(mongo-param master replSet) ]
+  then
+     logmsg "Wait 30 seconds to let mongo start and elect primary"
+     sleep 30
+  fi
+  logpop
+}
+
+function mongo-stop-all ()
+{
+  logpush mongo-stop-all
+  for i in $(mongo-confs)
+  do
+    mongo-stop ${i}
+  done
+
+  killall mongod &> /dev/null
+  logpop
+}
+
+function mongo-delete ()
+{
+  logpush mongo-delete
+
+  logmsg "Stop ${1}"
+  mongo-stop ${1}
+
+  logmsg "Parse ${1}"
+
+  local filestodelete
+
+  local dbpath=$(mongo-param ${1} dbpath) && filestodelete="${filestodelete} ${dbpath}"
+  local dbpid=$(mongo-param ${1} pidfilepath) && filestodelete="${filestodelete} ${dbpid}"
+  local dblog=$(mongo-param ${1} logpath) && filestodelete="${filestodelete} ${dblog}*"
+  filestodelete="${filestodelete} $(mongo-config ${1})"
+
+  logmsg "will delete ${filestodelete}"
+
+  for t in "${filestodelete}"
+  do
+    if [[ -n $f ]]; then
+      logmsg "Delete ${t}"
+      check rm -rf ${t}
+    fi
+  done
+
+  logpop
+}
+
+function mongo-delete-all ()
+{
+  logpush mongo-delete-all
+
+  for i in $(mongo-confs)
+  do
+    logmsg "Delete instance ${i}"
+    mongo-delete ${i}
+  done
+
+  logpop
+}
+
+
+# Create the configuration files and basic directory structure for MongoDB
+function mongo-create-instance ()
+{
+
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  logpush mongo-create-instance
+
+  not-empty-or-fail "${1}" "Usage : mongo-create-instance <name>"
+
+  name=${1}
+
+  # Count the number of instances already existing
+  let count=$(mongo-confs | wc -l)
+  let port="27017+(${count}*2)"
+
+  local file=/etc/mongod.conf.d/mongod-${name}.conf
+
+  have-file ${file} &&
+  failure "MongoDB instance ${name} already exists in ${file}"
+
+  logmsg "Creating new MongoDB instance ${name}"
+  logmsg "Found ${count} existing config, will use port ${port}"
+
+  check mkdir -p /etc/mongod.conf.d
+  check touch /etc/mongod.conf.d
+  check touch ${file}
+  cat > ${file} << EOF
+# mongo.conf
+
+fork = true
+port = ${port}
+
+dbpath = /var/lib/mongodb/${name}/db
+pidfilepath = /var/lib/mongodb/${name}/mongod.pid
+logpath = /var/lib/mongodb/${name}/mongod.log
+smallfiles = true
+
+#keyFile = /etc/mongod.conf.d/mongodb-keyfile
+
+EOF
+
+  logmsg "Created instance as ${file}"
+  logpop
+}
+
+
+function mongo-create-rs ()
+{
+
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  mongo-create-instance slave
+  mongo-create-instance arbiter
+  mongo-rs-initiate
+
+  # Check rs status
+  mongo-rs-status
+
+  # Add slaves
+  mongo-rs-add slave
+  mongo-rs-arb arbiter
+}
+
+function mongo-add-admin ()
+{
+  logpush mongo-add-admin
+  logmsg "Add admin user"
+  if [ "${OS}" == "Ubuntu" ]; then
+    mongo << EOF
+use admin
+db.createUser({user:"admin",pwd:"admin",roles: [{role:"root", db:"admin"}] });
+EOF
+  else
+    mongo-run << EOF
+use admin
+db.createUser({user:"admin",pwd:"admin",roles: [{role:"root", db:"admin"}] });
+EOF
+  fi
+  logpop
+}
+
+function mongo-run-fg ()
+{
+  mongo "${@}" $(getMongoAddr)
+}
+
+function mongo-run ()
+{
+  logpush mongo-run
+
+  mongo-run-fg "${@}" &> /dev/null ||
+  failure "Error on mongo ${@}"
+
+  logpop
+}
+
+# Initiate the replica set, has to be done once on the master
+function mongo-rs-initiate ()
+{
+  logpush mongo-rs-initiate
+
+  mongo-stop-all
+
+  for i in $(mongo-confs)
+  do
+    param-set ${i} replSet replica
+  done
+
+  mongo-start-all
+
+  mongo-run << EOF
+rs.initiate ();
+EOF
+
+  logpop
+}
+
+function mongo-rs-status ()
+{
+  logpush mongo-rs-status
+
+  mongo-run << EOF
+rs.status ();
+EOF
+
+  logpop
+}
+
+function mongo-rs-rem ()
+{
+  logpush mongo-rs-rem
+
+  local port=$(mongo-param ${1} port)
+  local host=$(hostname)
+
+  not-empty-or-fail "${port}" "Error : could not get port"
+  not-empty-or-fail "${host}" "Error : could not get host"
+
+  logmsg "Remove instance ${1} ${host}:${port} from replica set"
+
+  mongo-run << EOF
+rs.remove ("${host}:${port}");
+rs.status ();
+EOF
+
+  logpop
+}
+
+function mongo-rs-primary ()
+{
+  logpush mongo-rs-primary
+
+  mongo-run << EOF
+cfg = rs.conf ();
+cfg.members[0].priority = 1;
+rs.reconfig (cfg);
+EOF
+
+  sleep 5
+
+  logpop
+}
+
+
+# Add a slave node to the replica set
+function mongo-rs-add ()
+{
+  logpush mongo-rs-add
+
+  local port=$(mongo-param ${1} port)
+  local host=$(hostname)
+
+  not-empty-or-fail "${port}" "Error : could not get port"
+  not-empty-or-fail "${host}" "Error : could not get host"
+
+
+  while true
+  do
+
+    logmsg "Adding instance ${1} ${host}:${port} to replica set"
+
+    mongo-run << EOF
+rs.add ("${host}:${port}");
+EOF
+
+    mongo-run-fg << EOF |
+rs.status ();
+EOF
+    grep -q -e "${host}:${port}" &&
+    break
+
+    logmsg "Failed, will retry in 5 seconds"
+    sleep 5
+
+  done
+
+  logpop
+}
+
+# Add an arbiter node to the replica set
+function mongo-rs-arb ()
+{
+  logpush mongo-rs-arb
+
+  local port=$(mongo-param ${1} port)
+  local host=$(hostname)
+
+  not-empty-or-fail "${port}" "Error : could not get port"
+  not-empty-or-fail "${host}" "Error : could not get host"
+
+  logmsg "Adding arbiter ${1} ${host}:${port} to replica set"
+
+  mongo-run << EOF
+rs.addArb ("${host}:${port}");
+rs.status ();
+EOF
+
+  logpop
+}
+
+# Clear a db completely, usefull for importing new services from scratch
+function mongo-db-drop ()
+{
+  mongo-run << EOF
+db.dropDatabase ();
+EOF
+}
+
+# Create a dump of the database to save a full snapshot
+function mongo-db-backup ()
+{
+  logpush mongo-db-backup
+  not-empty-or-fail "${1}" "Usage : mongo-db-backup <output path> [...]"
+
+  local addr=($(mongo-address))
+
+  check mongodump ${MONGODUMP_USER_PASS} -h "${addr[0]}" --port "${addr[1]}" -d "${addr[2]}" -o "${@}"
+
+  local bsons=$(find "${1}" -type f -name "*.bson" | sort)
+  local out="config/$(echo "${1}" | sed -e "s|/|-|g")"
+  check rm -f "${out}.txt"
+  check touch "${out}.txt"
+  for bson in ${bsons}
+  do
+
+    cat >> "${out}.txt" << EOF
+
+$(basename ${bson})
+
+EOF
+
+    bson-view "${bson}" >> "${out}.txt" 2>/dev/null
+
+  done
+
+  check rm -f "${out}.tgz"
+  check tar -zcf "${out}.tgz" "${1}"
+
+  logpop
+}
+
+# Retore a backup
+function mongo-db-restore ()
+{
+  logpush mongo-db-restore
+  local addr=($(mongo-address))
+  check mongorestore -h "${addr[0]}" --port "${addr[1]}" "${@}"
+  logpop
+}
+
+function bson-to-json ()
+{
+  logpush bson-to-json
+  have-file-or-fail "${1}"
+  have-cmd-or-fail bsondump
+
+  check-fg bsondump "${1}"
+
+  logpop
+}
+
+# Pretty print the content of a bson file created by from backup
+function bson-view ()
+{
+  logpush bson-view
+
+  bson-to-json "${1}" |
+  while read line
+  do
+    echo -e "${line}" |
+    python -c "${PY_PRETTY_JSON}" ||
+    true
+  done
+
+  logpop
+}
+
+# Interprets the current mongo address to break down the address into 3 parameters
+function mongo-address ()
+{
+  local h
+  local i
+  local p
+  local d
+
+  local address="$(getMongoAddr)"
+
+  if echo ${address} | grep -qe '/'
+  then
+    h=$(echo ${address} | cut -d '/' -f 1)
+    d=$(echo ${address} | cut -d '/' -f 2)
+  else
+    d=${address}
+  fi
+
+  if echo ${h} | grep -qe ':'
+  then
+    i=$(echo ${h} | cut -d ':' -f 1)
+    p=$(echo ${h} | cut -d ':' -f 2)
+  else
+    i=${h}
+  fi
+
+  [ -z "${i}" ] && i=localhost
+  [ -z "${p}" ] && p=27017
+  [ -z "${d}" ] && d=$(basename ${MONGODIR})
+
+  #force i to localhost
+  i=localhost
+
+  echo -e "${i} ${p} ${d}"
+}
+
+function pymongo-params ()
+{
+  local addr=($(mongo-address))
+  logmsg "${addr[0]}:${addr[1]}/${addr[2]}"
+
+  cat << EOS
+from pymongo import MongoClient;
+
+cl = MongoClient ('${addr[0]}', ${addr[1]});
+db = cl.${addr[2]};
+
+EOS
+
+}
+
+# Read a key from mongodb
+function mongo-get ()
+{
+  logpush mongo-get
+
+  local co=$(echo -e "${1}" | cut -d '.' -f 1)
+  local id=$(echo -e "${1}" | cut -d '.' -f 2)
+  local ky=$(echo -e "${1}" | cut -d '.' -f 3- | sed -e "s|\.|'][u'|g")
+
+  not-empty-or-fail "${ky}" "Usage : mongo-get <collection.id.key>"
+  check-fg python - << EOF
+$(pymongo-params)
+co = db.${co};
+rc = co.find_one({"_id": "${id}"});
+
+print (rc[u'${ky}']);
+EOF
+  logpop
+}
+
+# Dump a map of name and url keys in table
+function mongo-get-url-map ()
+{
+  logpush mongo-get-url-map
+
+  local co=$(echo -e "${1}" | cut -d '.' -f 1)
+
+  not-empty-or-fail "${co}" "Usage : mongo-get-url-map <collection>"
+
+  check-fg python - << EOF
+$(pymongo-params)
+co = db.${co};
+rc = co.find();
+
+for i in rc:
+  print (i[u'_id'] + " " + i[u'url']);
+
+EOF
+  logpop
+}
+
+# Check if mongo key has given value
+function mongo-is ()
+{
+  logpush mongo-is
+  not-empty-or-fail "${2}" "Usage : mongo-is <key> <value>"
+  local value=$(mongo-get "${@}")
+
+  [ "${value}" == "${2}" ] ||
+  failure "Error : Property [${1}] is '${value}', expecting '${2}'"
+  logpop
+}
+
+# Update the services control flags
+# ${1} control : [enable/disable]
+# ${2} control_action : [...]
+function mongo-service-control ()
+{
+  logpush mongo-service-control
+
+  not-empty-or-fail "${1}" "Usage : mongo-service-control <control> [action]"
+
+  mongo-run << EOF
+db.services.update ({}, {\$set: {control: '${1}', control_action: '${2}', timestamp: '$(date-iso)'}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-control-switch ()
+{
+  logpush mongo-service-control-switch
+
+  not-empty-or-fail "${2}" "Usage : mongo-service-control-switch <match> <new>"
+
+  mongo-run << EOF
+db.services.update ({control: '${1}'}, {\$set: {control: '${2}', timestamp: '$(date-iso)'}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+# Update the services control flags
+# ${1} control : [enable/disable]
+# ${2} control_action : [...]
+function mongo-service-specific-control ()
+{
+  logpush mongo-service-specific-control
+
+  not-empty-or-fail "${2}" "Usage : mongo-service-specific-control <id> <control> [action]"
+
+  mongo-run << EOF
+db.services.update ({_id: '${1}'}, {\$set: {control: '${2}', control_action: '${3}', timestamp: '$(date-iso)'}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-unquarantine ()
+{
+  logpush mongo-service-unquarantine
+
+  mongo-run << EOF
+db.services.update ({control: 'quarantined'}, {\$set: {control: 'enabled', timestamp: '$(date-iso)'}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-group ()
+{
+  logpush mongo-service-group
+
+  not-empty-or-fail "${1}" "Usage : mongo-service-group <group>"
+
+  mongo-run << EOF
+db.services.update ({}, {\$set: {group: '${1}', timestamp: '$(date-iso)'}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-keepalive ()
+{
+  logpush mongo-service-keepalive
+
+  mongo-run << EOF
+db.services.update ({}, {\$set: {ltrx: {keepalive_timestamp: '$(date-iso)'}}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-clear-reservation ()
+{
+  logpush mongo-service-clear-reservation
+
+  mongo-run << EOF
+db.services.update ({}, {\$unset: {ltrx: {}}}, {multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-clear-reservation-spec ()
+{
+  logpush mongo-service-clear-reservation-spec
+
+  not-empty-or-fail "${1}" "Usage : mongo-service-clear-reservation-spec <id>"
+
+  mongo-run << EOF
+db.services.update ({_id: '${1}'}, {\$unset: {ltrx: {}}}, {multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-steal-reservation ()
+{
+  logpush mongo-service-clear-reservation
+
+  let now=$(date +%s)+300
+
+  mongo-run << EOF
+db.services.update ({}, {\$set: {ltrx: {keepalive_timestamp: '$(date-iso -d "@${now}")', instance_id: 'Muhahaha'}}}, {upsert: false, multi: true});
+EOF
+
+  logpop
+}
+
+function mongo-service-monitor ()
+{
+  logpush mongo-service-monitor
+
+  not-empty-or-fail "${1}" "Usage : mongo-service-monitor <id>"
+
+  while true
+  do
+
+    indx=$(printf "%04d" "$(find config/ -maxdepth 1 -type f -name "service-${1}-*.json" | wc -l)")
+
+    mongo $(getMongoAddr) > config/service-${1}-${indx}.json << EOF
+db.services.find ({_id: '${1}'}).pretty ();
+EOF
+
+
+#
+#
+#
+#   if [ ! -e "config/mongo-${1}-prev.json" ]
+#   then
+#
+#     cp config/mongo-${1}-curr.json config/mongo-${1}-prev.json
+#
+#   fi
+#
+#   if ! diff -q config/mongo-${1}-curr.json config/mongo-${1}-prev.json
+#   then
+#
+#     logmsg "Service ${1} just changed!"
+#
+#     local a
+#     local b
+#
+#     for ((a=8;a>0;a--))
+#     do
+#
+#       let b=${a}+1
+#
+#     logmsg config/mongo-${1}-${a}.json
+#
+#       if [ -e "config/mongo-${1}-${a}.json" ]
+#       then
+#
+#         cp -vf config/mongo-${1}-${a}.json config/mongo-${1}-${b}.json
+#
+#       fi
+#
+#     done
+#
+#     cp -vf config/mongo-${1}-prev.json config/mongo-${1}-${a}.json
+#     cp -vf config/mongo-${1}-curr.json config/mongo-${1}-prev.json
+#
+#   fi
+
+  sleep 1
+
+  done
+
+  logpop
+}
+
+function create-mongo-populate ()
+{
+  logpush create-mongo-populate
+  not-empty-or-fail "${2}" "Usage : create-mongo-populate <template path> <output filename>"
+  have-file-or-fail "${1}"
+
+  check mkdir -p "$(dirname ${2})"
+  check touch "${2}"
+  check chmod +x "${2}"
+
+  cat > "${2}" << EOF
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+var timestamp = "\$(date -u +"${DATE_ISO_8601}")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+EOF
+
+  for t in profile target source service operation
+  do
+
+    echo -e "var ${t} = [" >> "${2}"
+
+    local add=false
+    for p in $(find ${1} -name "${t}*.json" | sort)
+    do
+      cat ${p} >> "${2}"
+      echo -e "," >> "${2}"
+      add=true
+    done
+
+    type=""
+    if [ ${t} == "operation" ]; then
+       type="video."
+    fi
+    echo -e "];" >> "${2}"
+
+    ${add} && cat >> "${2}" << EOF
+
+db.${t}s.${type}insert (${t});
+
+
+EOF
+
+  done
+
+  cat >> "${2}" << EOF
+
+EOS
+
+: \${MONGODB_URL:="ltrx"}
+#mongo \${MONGODB_URL} config/mongo-populate.js
+EOF
+
+  logpop
+}
+
+# Get the current timestamp in ISO-8601 format
+function date-iso ()
+{
+  date -u +"${DATE_ISO_8601}" "${@}"
+}
+
+function ft-list ()
+{
+  find ${WORKDIR}/cases/ -maxdepth 1 -mindepth 1 -type d -not -name ".svn" -exec basename {} \; | sort
+}
+
+function ft-svn-ignore ()
+{
+  logpush ft-svn-ignore
+
+  if [ -z "${1}" ]
+  then
+
+    entries=$(ft-list)
+
+    for entry in ${entries}
+    do
+      ft-svn-ignore ${entry}
+    done
+
+  else
+
+    local target="${WORKDIR}/cases/${1}"
+    if have-cmd svn
+    then
+
+      logmsg "Updating svn ignore"
+      check svn propset svn:ignore "$(echo -e "*")" "${target}"
+      check svn propset svn:ignore "$(echo -e "*")" "${target}/medias"
+      check svn propset svn:ignore "$(echo -e "*")" "${target}/services"
+      check svn propset svn:ignore "$(echo -e "*")" "${target}/config"
+
+    fi
+
+  fi
+
+  logpop
+}
+
+# Create a new functional test from generic template
+function ft-create ()
+{
+  logpush ft-create
+
+  not-empty-or-fail "${1}" "Usage : ft-create <name>"
+
+  local target="${WORKDIR}/cases/${1}"
+  local templates="${WORKDIR}/templates"
+
+  have-file-or-fail "${templates}"
+
+  have-file "${target}" &&
+  failure "Test already exists in ${target}"
+
+  logmsg "Create new test ${target}"
+  check mkdir -p ${target}/{medias,services,config}
+
+  logmsg "Copy templates"
+  check cp -vf ${templates}/ltrx/* "${target}/config/"
+
+  logmsg "Create mongo-populate"
+  create-mongo-populate "${templates}/service/" "${target}/config/mongo-populate"
+
+  logmsg "Copy launchers"
+  check cp -vf ${templates}/launch/* "${target}/"
+
+  logmsg "Copy utilities"
+  check ln -s "../../utilities" "${target}"
+
+  if have-cmd svn
+  then
+
+    logmsg "Add to SVN"
+    check svn add "${target}"
+    ft-svn-ignore "${1}"
+
+  fi
+
+  logpop
+}
+
+# Get the value of a variable from its name
+function env-var-value ()
+{
+  eval echo "\$${1}"
+}
+
+# Returns true if the given variable has empty value
+function env-var-empty ()
+{
+  [ -z "$(env-var-value "${1}")" ]
+}
+
+# Logs a message when var is empty
+function env-var-empty-log ()
+{
+  logpush env-var-empty-log
+  not-empty-or-fail "${1}" "Usage : env-var-empty-log <variable>"
+
+  local res=false
+  if env-var-empty "${1}"
+  then
+    res=true
+    logmsg "${1}"
+  fi
+
+  logpop
+
+  ${res}
+}
+
+# Prints an export command to save a variable
+function env-var-export ()
+{
+  logpush env-var-export
+  not-empty-or-fail "${1}" "Usage : env-var-export <variable>"
+
+  local v="$(env-var-value "${1}")"
+  not-empty-or-fail "${v}" "No value for ${1}"
+
+  if [ "${v}" != "nil" ]
+  then
+    printf "export %25s=\"%s\"\n" "${1}" "$(echo -e ${v})"
+  else
+    logmsg "Ignore optional variable ${1}"
+  fi
+  logpop
+}
+
+# Filter the LTRX log to remove all volatile tokens such as pointers and timestamps
+function ltrx-log-filter ()
+{
+  sed \
+    -e "s|^.[ ]*.[0-9]*ms ||g" \
+    -e "s|.[0-9]*-.[0-9]*-.[0-9]*T.[0-9]*:.[0-9]*:.[0-9]*\..[0-9]*+.[0-9]*||g" \
+    -e "s|LTRX_.[0-9]*|LTRX|g" \
+    -e "s|0x.[0-9,a-f,A-F]*|<ptr>|g" \
+    -e "s|.[0-9].[0-9]*\..[0-9].[0-9]*|.|g" \
+    "${@}"
+}
+
+# Compare two logs files to spot differences between runs
+function ltrx-log-diff ()
+{
+  logpush ltrx-log-diff
+
+  local ref="config/ltrx.log.bak"
+  local cmp="config/ltrx.log"
+  local cmd
+
+  have-file-or-fail "${ref}"
+  have-file-or-fail "${cmp}"
+
+  if [ ! -z "${1}" ]
+  then
+    cmd=(grep -i -v)
+    for p in "${@}"
+    do
+      cmd=(${cmd[@]} -e "${p}")
+    done
+  else
+    cmd=(cat)
+  fi
+
+  ${cmd[@]} "${ref}" | ltrx-log-filter | grep -e "^|" > "${ref}.filtered"
+  ${cmd[@]} "${cmp}" | ltrx-log-filter | grep -e "^|" > "${cmp}.filtered"
+
+  diff -U100000 "${ref}.filtered" "${cmp}.filtered" > "${cmp}.diff"
+
+  logpop
+}
+
+
+# Configures the environment for rmss from deb install
+function rmss-env-deb ()
+{
+  echo "no rmss deb"
+}
+
+# Configures the environment for ltrx from RPM install
+function rmss-env-rpm ()
+{
+  base=/opt/spotxde
+
+  AC3_INST_DIR="${base}/share/ac3dec"
+  FONTCONFIG_FILE="/opt/spotxde/share/ltrx/fontconfig/fonts/fonts.conf"
+  FONTCONFIG_PATH="/opt/spotxde/share/ltrx/fontconfig/fonts"
+  GST_DEBUG="*:1,GST_ELEMENT_FACTORY:0,GST_REFCOUNTING:0,GST_REGISTRY:0,GST_PLUGIN_LOADING:2,${GST_DEBUG}"
+  GST_DEBUG_NO_COLOR="1"
+  GST_PLUGIN_PATH="/opt/van-gst/lib/gstreamer-${GST_VERSION}:${base}/lib/rmss/gstreamer-${GST_VERSION}"
+  GST_REGISTRY="${WORKDIR}/config/registry-rmss.x86_64.bin"
+  GST_REGISTRY_UPDATE="yes"
+  LD_LIBRARY_PATH="${base}/lib/rmss:${base}/lib/rmss/gstreamer-${GST_VERSION}:/opt/intel/mediasdk/lib64"
+  LIBVA_DRIVERS_PATH="${base}/lib/rmss/dri"
+  LIBVA_DRIVER_NAME="iHD"
+  MAGIC="${base}/share/rmss/magic"
+  MAGICK_HOME="${base}/share/rmss/ImageMagick"
+  PANGO_RC_FILE="${base}/share/rmss/pangorc"
+  PATH="${base}/sbin:${PATH}"
+  SPOTXDE_MIME="${base}/share/rmss/mimeTypeDB.xml"
+  LUA_PATH=";;${base}/lib/rmss/lua-ext/share/?.lua;${base}/share/plugins/?.lua"
+  LUA_CPATH=";;${base}/lib/rmss/lua-ext/lib/?.so;${base}/lib/plugins/?.so"
+  VANTRIX_MI_PARSER_PATH="${base}/share/rmss/parsers/"
+  REVISION_PLATFORM="nil"
+  REVISION_STABLE="nil"
+  REVISION_DYNAMIC="nil"
+  REVISION_CORE="nil"
+  REVISION_MSV="nil"
+
+  ltrx-env-write
+
+  cat << EOF
+
+source ${WORKDIR}/utilities
+check have-rpm "${__find_rpm}"
+
+EOF
+}
+
+# Print the variables needed to run the ltrx
+function ltrx-env-write ()
+{
+  logpush ltrx-env-write
+
+  cat << EOF
+#!/bin/bash
+
+EOF
+
+  env-var-export AC3_INST_DIR
+  env-var-export FONTCONFIG_FILE
+  env-var-export FONTCONFIG_PATH
+  env-var-export GST_DEBUG
+  env-var-export GST_DEBUG_NO_COLOR
+  env-var-export GST_PLUGIN_PATH
+  env-var-export GST_REGISTRY
+  env-var-export GST_REGISTRY_UPDATE
+  env-var-export LD_LIBRARY_PATH
+  env-var-export LIBVA_DRIVERS_PATH
+  env-var-export LIBVA_DRIVER_NAME
+  env-var-export MAGIC
+  env-var-export MAGICK_HOME
+  env-var-export PANGO_RC_FILE
+  env-var-export PATH
+  env-var-export SPOTXDE_MIME
+  env-var-export VANTRIX_MI_PARSER_PATH
+  env-var-export REVISION_PLATFORM
+  env-var-export REVISION_STABLE
+  env-var-export REVISION_DYNAMIC
+  env-var-export REVISION_CORE
+  env-var-export REVISION_MSV
+  env-var-export GDK_PIXBUF_MODULEDIR
+  env-var-export GDK_PIXBUF_LOADER
+  env-var-export GDK_PIXBUF_MODULE_FILE
+  env-var-export CEF_SUBPROCESS_PATH_ENV
+  env-var-export CEF_LOCALES_DIR_ENV
+  env-var-export GIO_EXTRA_MODULES
+  cat << EOF
+
+# Using $(which vantrxengine 2>/dev/null)
+# User id ${USER} : $(whoami)
+
+"\${@}" 2>&1
+
+EOF
+  logpop
+}
+
+
+# Configures the environment for ltrx from DEB install
+function ltrx-env-deb ()
+{
+  base=/opt/spotxde
+
+  AC3_INST_DIR="${base}/share/ac3dec"
+  FONTCONFIG_FILE="nil"
+  FONTCONFIG_PATH="nil"
+  GST_DEBUG="*:1,GST_ELEMENT_FACTORY:0,GST_REFCOUNTING:0,GST_REGISTRY:0,GST_PLUGIN_LOADING:2,${GST_DEBUG}"
+  GST_DEBUG_NO_COLOR="1"
+  GST_PLUGIN_PATH="${base}/lib/ltrx/gstreamer-${GST_VERSION}"
+  GST_REGISTRY="${WORKDIR}/config/registry-ltrx.x86_64.bin"
+  GST_REGISTRY_UPDATE="yes"
+  LD_LIBRARY_PATH="${base}/lib/ltrx:${base}/lib/ltrx/gstreamer-${GST_VERSION}:${base}/share/ltrx/parsers/"
+  LIBVA_DRIVER_NAME="nil"
+  MAGIC="${base}/share/ltrx/magic"
+  MAGICK_HOME="nil"
+  PANGO_RC_FILE="nil"
+  PATH="${base}/sbin:${PATH}"
+  SPOTXDE_MIME="${base}/share/ltrx/mimeTypeDB.xml"
+  VANTRIX_MI_PARSER_PATH="${base}/share/ltrx/parsers/"
+  REVISION_PLATFORM="nil"
+  REVISION_STABLE="nil"
+  REVISION_DYNAMIC="nil"
+  REVISION_CORE="nil"
+  REVISION_MSV="nil"
+  GDK_PIXBUF_MODULEDIR="nil"
+  GDK_PIXBUF_LOADER="nil"
+  GDK_PIXBUF_MODULE_FILE="nil"
+  CEF_SUBPROCESS_PATH_ENV="${base}/lib/ltrx/gstcefsubprocess"
+  CEF_LOCALES_DIR_ENV="${base}/lib/ltrx/locales"
+  GIO_EXTRA_MODULES="${base}/lib/ltrx/gio/modules/"
+
+  if [ -e "/opt/intel/mediasdk" ]
+  then
+    LD_LIBRARY_PATH="/opt/intel/mediasdk/lib64:${LD_LIBRARY_PATH}"
+    LIBVA_DRIVERS_PATH="/opt/intel/mediasdk/lib64"
+  else
+    LIBVA_DRIVERS_PATH="${base}/lib/ltrx"
+  fi
+
+  ltrx-env-write
+
+}
+
+# Configures the environment for ltrx from RPM install
+function ltrx-env-rpm ()
+{
+  base=/opt/spotxde
+
+  AC3_INST_DIR="${base}/share/ac3dec"
+  FONTCONFIG_FILE="/opt/spotxde/share/ltrx/fontconfig/fonts/fonts.conf"
+  FONTCONFIG_PATH="/opt/spotxde/share/ltrx/fontconfig/fonts"
+  GST_DEBUG="*:1,GST_ELEMENT_FACTORY:0,GST_REFCOUNTING:0,GST_REGISTRY:0,GST_PLUGIN_LOADING:2,${GST_DEBUG}"
+  GST_DEBUG_NO_COLOR="1"
+  GST_PLUGIN_PATH="/opt/van-gst/lib/gstreamer-${GST_VERSION}:${base}/lib/ltrx/gstreamer-${GST_VERSION}"
+  GST_REGISTRY="${WORKDIR}/config/registry-ltrx.x86_64.bin"
+  GST_REGISTRY_UPDATE="yes"
+  LD_LIBRARY_PATH="/opt/van-gst/lib:${base}/lib/ltrx:${base}/lib/ltrx/gstreamer-${GST_VERSION}"
+  LIBVA_DRIVER_NAME="iHD"
+  MAGIC="${base}/share/ltrx/magic"
+  MAGICK_HOME="${base}/share/ltrx/ImageMagick"
+  PANGO_RC_FILE="${base}/share/ltrx/pangorc"
+  PATH="${base}/sbin:${PATH}"
+  SPOTXDE_MIME="${base}/share/ltrx/mimeTypeDB.xml"
+  VANTRIX_MI_PARSER_PATH="${base}/share/ltrx/parsers/"
+  REVISION_PLATFORM="nil"
+  REVISION_STABLE="nil"
+  REVISION_DYNAMIC="nil"
+  REVISION_CORE="nil"
+  REVISION_MSV="nil"
+  GDK_PIXBUF_MODULEDIR="${base}/lib/ltrx/gdk-pixbuf-2.0/2.10.0/loaders/"
+  GDK_PIXBUF_LOADER=`find ${base} -name gdk-pixbuf-query-loaders`
+  GDK_PIXBUF_MODULE_FILE="${WORKDIR}/config/loaders.cache"
+  CEF_SUBPROCESS_PATH_ENV="${base}/lib/ltrx/gstcefsubprocess"
+  CEF_LOCALES_DIR_ENV="${base}/lib/ltrx/locales"
+  GIO_EXTRA_MODULES="${base}/lib/ltrx/gio/modules/"
+
+  if [ -e "/opt/intel/mediasdk" ]
+  then
+    LD_LIBRARY_PATH="/opt/intel/mediasdk/lib64:${LD_LIBRARY_PATH}"
+    LIBVA_DRIVERS_PATH="/opt/intel/mediasdk/lib64"
+  else
+    LIBVA_DRIVERS_PATH="${base}/lib/ltrx"
+  fi
+
+  ltrx-env-write
+
+}
+
+# Configures the environment for ltrx from actual config
+function ltrx-env-cur ()
+{
+  base=/opt/spotxde
+
+  # Overide some key properties
+  unset GST_REGISTRY
+  unset GST_REGISTRY_UPDATE
+
+  ltrx-env-fill
+  ltrx-env-write
+}
+
+function rmss-env-cur ()
+{
+  ltrx-env-cur
+}
+
+# Configures the environment for ltrx from actual config
+function ltrx-env-dev ()
+{
+  base=/opt/spotxde
+
+  if have-file ${HOME}/opt/msv/head/envrun
+  then
+    source ${HOME}/opt/msv/head/envrun
+    GDK_PIXBUF_MODULEDIR="${HOME}/opt/stable/head/gdk-pixbuf/2.21.7/lib/gdk-pixbuf-2.0/2.10.0/loaders/"
+    GDK_PIXBUF_LOADER="${HOME}/opt/stable/head/gdk-pixbuf/2.21.7/bin/gdk-pixbuf-query-loaders"
+  elif have-file /opt/van/msv/head/envrun
+  then
+    source /opt/van/msv/head/envrun
+    GDK_PIXBUF_MODULEDIR="/opt/van/stable/head/gdk-pixbuf/2.21.7/lib/gdk-pixbuf-2.0/2.10.0/loaders/"
+    GDK_PIXBUF_LOADER="/opt/van/stable/head/gdk-pixbuf/2.21.7/bin/gdk-pixbuf-query-loaders"
+  fi
+  GDK_PIXBUF_MODULE_FILE="${WORKDIR}/config/loaders.cache"
+
+  # Overide some key properties
+  unset GST_REGISTRY
+  unset GST_REGISTRY_UPDATE
+
+  ltrx-env-fill
+  ltrx-env-write
+}
+
+function rmss-env-dev ()
+{
+  ltrx-env-dev
+}
+
+# Detects the environment and proposes some configuration for running the ltrx
+function ltrx-env ()
+{
+  logpush ltrx-env
+
+  if [ -z "${env_ltrx}" ]
+  then
+    if [ "${OS}" == "Ubuntu" ]; 
+    then
+      if have-cmd vantrxengine
+      then
+        logmsg "Using existing environment"
+        export env_ltrx=cur
+      elif have-deb spotxde-ltrx
+      then
+        logmsg "Using .DEB environment : ${__find_deb}"
+        export env_ltrx=deb
+      fi
+    else
+      # Centos
+      if have-cmd vantrxengine
+      then
+        logmsg "Using existing environment"
+        export env_ltrx=cur
+      elif have-file ${HOME}/opt/msv/head/envrun
+      then
+        logmsg "Using development environment"
+        export env_ltrx=dev
+      elif have-file /opt/van/msv/head/envrun
+      then
+        logmsg "Using development environment from /opt/van"
+        export env_ltrx=dev
+      elif have-rpm spotxde-ltrx
+      then
+        logmsg "Using RPM environment : ${__find_rpm}"
+        export env_ltrx=rpm
+      fi
+    fi
+  fi
+  # Dynamic function naming called next line : ltrx-env-cur ltrx-env-dev ltrx-env-rpm ltrx-env-deb
+  ${WORKDIR}/utilities ltrx-env-${env_ltrx}
+
+  logpop
+}
+
+# Detects the environment and proposes some configuration for running the rmss
+function rmss-env ()
+{
+  logpush rmss-env
+
+  if [ "${OS}" == "Ubuntu" ]; 
+  then
+    export env_rmss=deb
+  else
+    if [ -z "${env_rmss}" ]
+    then
+      if have-cmd vanstreamingserver
+      then
+        logmsg "Using existing environment"
+        export env_rmss=cur
+      elif have-file ${HOME}/opt/msv/head/envrun || have-file /opt/van/msv/head/envrun
+      then
+        logmsg "Using development environment"
+        export env_rmss=dev
+      elif have-rpm spotxde-rmss
+      then
+        logmsg "Using RPM environment : ${__find_rpm}"
+        export env_rmss=rpm
+      fi
+    else
+      logmsg "Using rmss env mode : ${env_rmss}"
+      if [ "${env_rmss}" == "rpm" ]
+      then
+        have-rpm spotxde-rmss
+        logmsg "Using RPM environment : ${__find_rpm}"
+      fi
+    fi
+  fi
+  # Dynamic function naming called next line : rmss-env-cur rmss-env-dev rmss-env-rpm rmss-env-deb
+  ${WORKDIR}/utilities rmss-env-${env_rmss}
+
+  logpop
+}
+
+# Checks if the environment has (mostly) everything needed to run the LTRX
+function ltrx-env-fill ()
+{
+  logpush ltrx-env-fill
+
+  env-var-empty-log AC3_INST_DIR            && export AC3_INST_DIR="nil"
+  env-var-empty-log FONTCONFIG_FILE         && export FONTCONFIG_FILE="/opt/spotxde/share/ltrx/fontconfig/fonts/fonts.conf"
+  env-var-empty-log FONTCONFIG_PATH         && export FONTCONFIG_PATH="/opt/spotxde/share/ltrx/fontconfig/fonts"
+  env-var-empty-log GST_DEBUG               && export GST_DEBUG="GST_ELEMENT_FACTORY:0,GST_REFCOUNTING:0,GST_REGISTRY:0,GST_PLUGIN_LOADING:2"
+  env-var-empty-log GST_DEBUG_NO_COLOR      && export GST_DEBUG_NO_COLOR="1"
+  env-var-empty-log GST_REGISTRY            && export GST_REGISTRY="${WORKDIR}/config/registry-ltrx.x86_64.bin"
+  env-var-empty-log GST_REGISTRY_UPDATE     && export GST_REGISTRY_UPDATE="yes"
+  env-var-empty-log LIBVA_DRIVER_NAME       && export LIBVA_DRIVER_NAME="iHD"
+  env-var-empty-log LIBVA_DRIVERS_PATH      && export LIBVA_DRIVERS_PATH="nil"
+  env-var-empty-log PANGO_RC_FILE           && export PANGO_RC_FILE="nil"
+  env-var-empty-log REVISION_PLATFORM       && export REVISION_PLATFORM="nil"
+  env-var-empty-log REVISION_STABLE         && export REVISION_STABLE="nil"
+  env-var-empty-log REVISION_DYNAMIC        && export REVISION_DYNAMIC="nil"
+  env-var-empty-log REVISION_CORE           && export REVISION_CORE="nil"
+  env-var-empty-log REVISION_MSV            && export REVISION_MSV="nil"
+  env-var-empty-log GDK_PIXBUF_MODULEDIR    && export GDK_PIXBUF_MODULEDIR="nil"
+  env-var-empty-log GDK_PIXBUF_LOADER       && export GDK_PIXBUF_LOADER='nil'
+  env-var-empty-log GDK_PIXBUF_MODULE_FILE  && export GDK_PIXBUF_MODULE_FILE='nil'
+  env-var-empty-log CEF_SUBPROCESS_PATH_ENV && export CEF_SUBPROCESS_PATH_ENV='nil'
+  env-var-empty-log CEF_LOCALES_DIR_ENV     && export CEF_LOCALES_DIR_ENV='nil'
+  env-var-empty-log GIO_EXTRA_MODULES       && export GIO_EXTRA_MODULES='nil'
+
+  logpop
+}
+
+# Checks if the environment has (mostly) everything needed to run the LTRX
+function ltrx-env-check ()
+{
+  logpush ltrx-env-check
+
+  local missing=false
+  env-var-empty-log AC3_INST_DIR
+  env-var-empty-log FONTCONFIG_FILE         && missing=true
+  env-var-empty-log FONTCONFIG_PATH         && missing=true
+  env-var-empty-log GST_DEBUG               && missing=true
+  env-var-empty-log GST_DEBUG_NO_COLOR      && missing=true
+  env-var-empty-log GST_PLUGIN_PATH         && missing=true
+  env-var-empty-log GST_REGISTRY            && missing=true
+  env-var-empty-log GST_REGISTRY_UPDATE     && missing=true
+  env-var-empty-log LD_LIBRARY_PATH         && missing=true
+  env-var-empty-log LIBVA_DRIVERS_PATH      && missing=true
+  env-var-empty-log LIBVA_DRIVER_NAME       && missing=true
+  env-var-empty-log MAGIC                   && missing=true
+  env-var-empty-log MAGICK_HOME             && missing=true
+  env-var-empty-log PANGO_RC_FILE
+  env-var-empty-log PATH                    && missing=true
+  env-var-empty-log SPOTXDE_MIME            && missing=true
+  env-var-empty-log VANTRIX_MI_PARSER_PATH  && missing=true
+  ${missing} && failure "Missing some mandatory environment variables"
+
+  have-cmd-or-fail vantrxengine
+
+  logpop
+}
+
+function valgrind-pid ()
+{
+  pgrep memcheck-amd64-
+}
+
+function ltrx-pid ()
+{
+  pgrep vantrxengine
+}
+
+function minio-pid ()
+{
+  pgrep minio
+}
+
+function ltrx-alive ()
+{
+  ltrx-pid > /dev/null
+}
+
+function minio-alive ()
+{
+  minio-pid > /dev/null
+}
+
+function ltrx ()
+{
+# config/ltrx.env "${@}" vantrxenginerefdbg --config-full-path "${WORKDIR}/config/ltrx.conf" --gst-debug-level=2 --gst-fatal-warnings
+  if ! [ -z $VALGRIND ];
+  then
+    VALGRIND_REPORT="./valgrind_report"
+    TP_SRC_PATH="${HOME}/source/head/"
+    for f in `find ${TP_SRC_PATH}/stable/sources -iname "*.supp"`; do
+      echo "Using suppression file ${f}"
+      VALGRIND_SUPPRESS_FILES="${VALGRIND_SUPPRESS_FILES} --suppressions=${f}"
+    done
+    for f in `find ${TP_SRC_PATH}/dynamic/sources -iname "*.supp"`; do
+      echo "Using suppression file ${f}"
+      VALGRIND_SUPPRESS_FILES="${VALGRIND_SUPPRESS_FILES} --suppressions=${f}"
+    done
+    for f in `find ${TP_SRC_PATH}/trxEngine -iname "*.supp"`; do
+      echo "Using suppression file ${f}"
+      VALGRIND_SUPPRESS_FILES="${VALGRIND_SUPPRESS_FILES} --suppressions=${f}"
+    done
+
+    rm ${VALGRIND_REPORT}
+
+    config/ltrx.env "${@}" \
+      valgrind --tool=memcheck --gen-suppressions=all --leak-resolution=high --leak-check=full -v --show-reachable=yes --num-callers=30 --log-file=${VALGRIND_REPORT} ${VALGRIND_SUPPRESS_FILES} \
+     vantrxengine --config-full-path "${WORKDIR}/config/ltrx.conf" --gst-debug-level=2
+  else
+    logmsg "STARTING tracked LTRX"
+    logmsg "config/ltrx.env ${@} vantrxengine --config-full-path "${WORKDIR}/config/ltrx.conf" --gst-debug-level=2 --mem-tracking-period=1"
+    config/ltrx.env "${@}" vantrxengine --config-full-path "${WORKDIR}/config/ltrx.conf" --gst-debug-level=2 --mem-tracking-period=1
+  fi
+}
+
+function minio-exec ()
+{
+  logmsg "STARTING tracked minio"
+
+  rm config/minio.log &> /dev/null
+  source config/minio.env
+
+  minio --quiet server "${WORKDIR}"
+}
+
+function ltrx-config ()
+{
+  logpush ltrx-config
+  not-empty-or-fail "${1}" "Usage : ltrx-config <key> [value]"
+  have-file-or-fail "config/ltrx.conf"
+  param-set "config/ltrx.conf" "${@}"
+  logpop
+}
+
+function core-dump-init ()
+{
+  logpush core-dump-init
+
+  local pattern=$(cat /proc/sys/kernel/core_pattern)
+
+  if [ "${pattern}" != "core" ]
+  then
+
+    if ! is-su
+    then
+      logmsg "You are not super user, please perform the following manually"
+      logmsg "echo core > /proc/sys/kernel/core_pattern"
+    fi
+
+    logmsg "Overiding core pattern '${pattern}' with 'core'"
+    check touch /proc/sys/kernel/core_pattern
+    echo core > /proc/sys/kernel/core_pattern
+  fi
+
+  local usespid=$(cat /proc/sys/kernel/core_uses_pid)
+  if [ "${usespid}" != "0" ]
+  then
+
+    if ! is-su
+    then
+      logmsg "You are not super user, please perform the following manually"
+      logmsg "echo 0 > /proc/sys/kernel/core_uses_pid"
+    fi
+
+    logmsg "Overiding core uses pid '${usespid}' with '0'"
+    check touch /proc/sys/kernel/core_uses_pid
+    echo 0    > /proc/sys/kernel/core_uses_pid
+  fi
+
+  logpop
+}
+
+function ltrx-run-fg ()
+{
+  local loop=true
+  while ${loop}; do
+    read -sn1 -p "Enter 'c' to continue with test, 'd' to dump > " opt
+    echo
+    case "${opt}" in
+      "d" | "D" )
+        ltrx-state;;
+      "c" | "C" )
+        loop=false;;
+    esac
+  done
+}
+
+# Launch the LTRX with optional debugging tools from arguments
+function ltrx-start ()
+{
+  logpush ltrx-start
+  ltrx-alive && failure "LTRX already running with PID : $(ltrx-pid)"
+
+  pud "${WORKDIR}"
+  have-file-or-fail "config/ltrx.env" " - Please run ft-setup to configure the environment"
+
+  local count=1
+  local ha=true
+  local fg=false
+  local run=false
+  local ctx
+  local index
+
+  while [ ! -z "${1}" ]
+  do
+    local opt="${1}"
+    local arg="${2}"
+
+    case "${opt}" in
+      --count)
+        count=${arg}
+        shift;;
+      --index)
+        index=${arg}
+        shift;;
+      --gdb)
+        ha=false
+        fg=true
+        ctx="gdb --args";;
+      --valgrind)
+        ctx="${VALGRIND_EXE} ${arg}"
+        shift;;
+      --run)
+        run=true;;
+    esac
+    shift
+  done
+
+  have-file config/mongo-populate ||
+  ha=false
+
+  if ${ha}
+  then
+    grep -e ha-sentinel-period config/ltrx.conf.t ||
+    ltrx-config ha-sentinel-period 1
+  else
+    ltrx-config ha-sentinel-period 0
+  fi
+
+  if ${fg}
+  then
+    ltrx ${ctx}
+    return 1
+  elif [[ -n ${index} ]]; then
+    ltrx ${ctx} > config/ltrx-${index}.log &
+  else
+    ltrx ${ctx} > config/ltrx.log &
+  fi
+
+  for ((n = 1; n < count; ++ n))
+  do
+    ltrx ${ctx} > config/ltrx-${n}.log &
+  done
+
+  if ${run}
+  then
+
+    logmsg "LTRX running in background ..."
+
+    local loop=true
+    while ${loop}; do
+      read -sn1 -p "[c, s, d, k] > " opt
+      echo
+      case "${opt}" in
+        "c" | "C" )
+          loop=false;;
+        "s" | "S" )
+          ltrx-state;;
+        "d" | "D" )
+          ltrx-dump;;
+        "k" | "K" )
+          kill-smooth;;
+      esac
+    done
+
+  fi
+
+  pod
+  logpop
+}
+
+# Launch the minio
+function minio-start ()
+{
+  logpush minio-start
+  minio-alive && failure "minio already running with PID : $(minio-pid)"
+
+  pud "${WORKDIR}"
+  have-file-or-fail "config/minio.sys/config/config.json" " - Missing minio configuration!"
+  have-file-or-fail "config/minio.env" " - Missing minio credentials!"
+
+  minio-exec &
+  
+  logmsg "minio running in background ..."
+
+  pod
+  logpop
+}
+
+function core-get-prog ( )
+{
+  gdb --batch --core=${1} 2>&1 | \
+  grep "Core was generated by" | \
+  sed -e "s|.*\`||g" | \
+  awk '{ print $1 }'
+}
+
+function ltrx-core ()
+{
+  local post=true
+  [ ! -z "${1}" ] && post=${1}
+
+  logpush ltrx-core
+  if have-file core
+  then
+
+    logmsg "Found a core dump, getting backtrace"
+
+    local prog=$(core-get-prog core)
+    local cmd=$(mktemp)
+
+    cat > ${cmd} << EOF
+display/i \$pc
+
+set confirm off
+set verbose off
+set print address on
+set print array on
+set print array-indexes off
+set print elements 0
+set print pretty on
+set print asm-demangle on
+set demangle-style auto
+set print object on
+set output-radix 10
+set input-radix 10
+set height 0
+set width 0
+set disassembly-flavor intel
+
+printf "\n\n-=-=-=-=-\nLocation of Crash\n\n"
+where
+
+printf "\n\n-=-=-=-=-\nAll Threads Backtraces\n\n"
+thread apply all bt
+EOF
+
+    ./config/ltrx.env \
+    gdb \
+      --core core \
+      $(basename ${prog}) \
+      --batch \
+      --command=${cmd} \
+      &> ./config/core-$(basename ${prog})-raw.log
+
+    rm -f ${cmd}
+
+    sed \
+      -e "s| 0x[0-9,a-f,A-F]* in | |g" \
+      -e "s|=<optimized out>|=?|g" \
+      -e "s|=0x0*^[0-9,a-f,A-F]|=0|g" \
+      -e "s|=0x[0-9,a-f,A-F]*|=P|g" \
+      ./config/core-$(basename ${prog})-raw.log \
+      > ./config/core-$(basename ${prog}).log
+
+    if ${post}
+    then
+
+      # fail the test
+      export __ft_result=false
+
+    else
+
+      logmsg "Ignoring core dump that occured during shutdown"
+
+    fi
+
+  fi
+  logpop
+}
+
+function ltrx-core-forensic ()
+{
+  logpush ltrx-core-forensic
+
+  local arch=./config/core.tgz
+
+  if ! have-file core && have-file ${arch}
+  then
+
+    logmsg "Extracting core dump from ${arch}"
+    check tar -zxvf ${arch}
+
+  fi
+
+  have-file-or-fail core
+  ./config/ltrx.env gdb --core core vantrxengine
+
+  logpop
+}
+
+function ltrx-restart ()
+{
+  logpush ltrx-reload
+
+  ltrx-stop
+  mongo-service-control enabled
+  mongo-service-clear-reservation
+  ltrx-start
+  logpop
+}
+
+function ltrx-reload ()
+{
+  logpush ltrx-reload
+
+  for p in $(ltrx-pid)
+  do
+    logmsg "Signal sighup ltrx ${p}"
+    check kill -s SIGHUP ${p}
+  done
+
+  logpop
+}
+
+function ltrx-state ()
+{
+  logpush ltrx-state
+
+  for p in $(ltrx-pid)
+  do
+    logmsg "Signal SIGUSR1 ltrx ${p}"
+    check kill -s SIGUSR1 ${p}
+  done
+
+  sleep 2
+  ltrx-dot
+
+  logpop
+}
+
+function ltrx-dump ()
+{
+  logpush ltrx-dump
+
+  ltrx-state
+
+  for p in $(ltrx-pid)
+  do
+    logmsg "Signal TRAP ltrx ${p}"
+    check kill -s SIGTRAP ${p}
+  done
+
+  for ((n=10; n > 0; --n))
+  do
+    ltrx-alive || break
+    logmsg "Waiting for ltrx to shutdown (${n})"
+    sleep 1
+  done
+
+  logpop
+}
+
+disableService=1
+function kill-smooth ()
+{
+  logpush kill-smooth
+
+  if [ $disableService -eq 1 ] && [ -z $DISABLE_MEMCHECK ] ;
+  then
+    mongo --host 127.0.0.1 ${res} ${MONGODIR} --eval 'db.services.update({},{$set:{"control":"disabled"}},{multi:true});' > /dev/null
+    disableService=0
+    sleep 7
+  fi
+
+  for sig in TERM TRAP KILL
+  do
+
+    for p in ${@}
+    do
+      [ -e /proc/${p}/status ] || break
+
+      logmsg "Signal ${sig} ${p}"
+      # check timeout 20 kill -s SIG${sig} ${p}
+      timeout 20 kill -s SIG${sig} ${p}
+      for ((n=30; n > 0; --n))
+      do
+        sleep 1
+
+        [ -e /proc/${p}/status ] || break
+
+        logmsg "Waiting for ${p} to shutdown (${n})"
+
+      done
+
+    done
+
+  done
+
+  for p in ${@}; do
+    check test ! -e /proc/${p}/status
+  done
+
+  logpop
+}
+
+# Stop the LTRX gracefully and trigger a core dump if it appears to be stuck
+function ltrx-stop ()
+{
+  logpush ltrx-stop
+
+  if ! [ -z VALGRIND ]
+  then
+    kill-smooth $(ltrx-pid)
+  else
+    kill-smooth $(valgrind-pid)
+  fi
+
+  if have-file config/ltrx.log.bak && have-file config/ltrx.log
+  then
+    ltrx-log-diff verbose private debug
+  fi
+
+  if have-file config/ltrx.env.bak
+  then
+    diff -U10000 config/ltrx.env.bak config/ltrx.env > config/ltrx.env.diff
+  fi
+
+  ltrx-dot
+
+  logmsg "Done"
+  logpop
+}
+
+# Stop the minio gracefully
+function minio-stop ()
+{
+  logpush minio-stop
+
+  kill-smooth $(minio-pid)
+
+  logmsg "Done"
+  logpop
+}
+
+function ltrx-dot ()
+{
+  logpush ltrx-dot
+  local loc=/tmp/
+  for d in $(find ${loc} -maxdepth 1 -type f -name "session-*.dot")
+  do
+    name=`basename $d`
+   logmsg "Found dot : $name"
+    if [[ "`echo $name | grep 0x`" ]]; then
+         num=`echo $name | awk -F. '{print $6}'`
+         dat=`echo $name | awk -F'[.-]' '{print $2"-"$3"-"$4"_"$5":"$6"."$7}'`
+         obj=`echo $name | awk -F'[.-]' '{print $8}'`
+         if `cat $d | grep label= | grep "GstPipeline" -q`; then
+           logmsg "Gstreamer 1 format found"
+           sessionName=`cat $d | grep label= | grep "GstPipeline)." | sed -e 's/;//g' -e "s@.*=@@g" -e "s/ /\./g" -e 's/"//g' | head -n1 | tail -n 1 |  awk -F').' '{print $2}'`
+           if [[ -z "$sessionName" ]]; then
+              sessionName=`cat $d | grep label= | grep "GstPipeline>" | sed -e 's/;//g' -e "s@.*=@@g" -e "s/ /\./g" -e 's/"//g' | head -n1 | tail -n 1 |  awk -F'\\\n' '{print $2}'`
+           fi
+           finalName=`echo session-${sessionName}.${dat}.${obj}.${num}` 
+         else
+           finalName=`cat $d | grep label= | grep -v "\[" | sed -e 's/;//g' -e "s@.*=@@g" -e "s/ /\./g" -e 's/"//g' | xargs -I {} echo session-{}.${dat}.${obj}.${num}`
+         fi
+         LD_LIBRARY_PATH="" dot -Tpng -o"${WORKDIR}/config/${finalName}.png" ${d} &> ${WORKDIR}/config/dot.log && \
+         logmsg "Rendered dot : $name to config/${finalName}.png"
+         mv ${d} "${WORKDIR}/config/${finalName}.dot" && \
+         logmsg "Moved dot : $name to config/${finalName}.dot"
+    fi
+
+  done
+  logpop
+}
+
+function ft-medias ()
+{
+  logpush ft-medias
+
+  true > config/medias.txt
+
+  for url in ${medias[@]}
+  do
+
+    echo -e "${url}" >> config/medias.txt
+
+    name=$(basename ${url})
+
+    if ! have-file "${GLOBAL_MEDIA_PATH}/medias/${name}"
+    then
+
+      logmsg "Fetching ${name} ..."
+      check mkdir -p "${GLOBAL_MEDIA_PATH}/medias"
+      check touch "${GLOBAL_MEDIA_PATH}/medias"
+
+      if wget -q -O "${GLOBAL_MEDIA_PATH}/medias/${name}" "${url}"
+      then
+        logmsg "Download complete!"
+      else
+        rm -f "${GLOBAL_MEDIA_PATH}/medias/${name}"
+        failure "Download failed for ${url}"
+      fi
+
+    fi
+
+    check mkdir -p medias
+    check touch medias
+    check ln -f -s "${GLOBAL_MEDIA_PATH}/medias/${name}" "medias/${name}"
+
+  done
+
+  logpop
+}
+
+function ft-fetch-all-medias ()
+{
+  logpush ft-fetch-all-medias
+
+  echo '#!/bin.bash' > medialist.sh
+  find cases/ -type f -name "run" -exec grep -E -e '^medias=\(\${medias\[@\]} *.*\) *$' {} \;  >> medialist.sh
+  . medialist.sh
+  rm -f medialist.sh #Fill is not needed anymore!
+
+  for url in ${medias[@]}
+  do
+
+    name=$(basename ${url})
+
+    if ! have-file "${GLOBAL_MEDIA_PATH}/medias/${name}"
+    then
+
+      logmsg "Fetching ${name} ..."
+      check mkdir -p "${GLOBAL_MEDIA_PATH}/medias"
+      check touch "${GLOBAL_MEDIA_PATH}/medias"
+
+      if wget -q -O "${GLOBAL_MEDIA_PATH}/medias/${name}" "${url}"
+      then
+        logmsg "Download complete!"
+      else
+        rm -f "${GLOBAL_MEDIA_PATH}/medias/${name}"
+        failure "Download failed for ${url}"
+      fi
+
+    fi
+
+
+  done
+
+  logpop
+}
+
+
+function ft-bootstrap-mongo
+{
+   logpush ft-bootstrap-mongo
+
+   logmsg "Start database"
+   mongo-start-all
+
+   logpop
+}
+
+# Prepare node for test execution, performs root operations
+function ft-bootstrap ()
+{
+  logpush ft-bootstrap
+
+  if ! is-su
+  then
+    logmsg "You are not super user, cannot continue"
+    check false
+  fi
+
+  logmsg "Overide core pattern"
+  core-dump-init
+
+  logmsg "Overide multicast route"
+  loopback-mc-route-on
+
+  logmsg "Create media storage"
+  mkdir -p ${GLOBAL_MEDIA_PATH}
+  chgrp users ${GLOBAL_MEDIA_PATH}
+  chmod g+w ${GLOBAL_MEDIA_PATH}
+
+  logmsg "Fix governor to performance"
+  for c in $(ls /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor)
+  do
+
+    echo performance > ${c}
+
+  done
+
+  logmsg "Lock GPU frequency"
+  command -v intel_gpu_frequency -m >/dev/null 2>&1 || { logmsg "bypassing intel_gpy_frequency since not present"; }
+
+  logpop
+}
+
+function ft-bootstrap-all ()
+{
+  logpush ft-bootstrap-all
+
+  have-file-or-fail slaves
+
+  #for line in $(cat slaves)
+  #do
+
+    #local targ=$(echo ${line} | cut -d @ -f 2)
+
+    logmsg "Deleting cores..."
+    check pssh -h slaves -l root -t 1000000000000 "find /var/lib/jenkins/ -type f -name 'core-*' -delete"
+    logmsg "Giving ownership to jenkins user..."
+    check pssh -h slaves -l root -t 1000000000000 "chown -R jenkins:users /var/lib/jenkins/workspace/FT-LTRX"
+    logmsg "Allowing jenkins user to have access to mongo..."
+    check pssh -h slaves -l root -t 1000000000000 "/var/lib/jenkins/workspace/FT-LTRX/utilities mongo-allow-non-root-user jenkins"
+    logmsg "Bootstrapping mongo..."
+    check pssh -h slaves -l jenkins -t 1000000000000 "/var/lib/jenkins/workspace/FT-LTRX/utilities ft-bootstrap-mongo"
+    logmsg "Bootstrapping slave..."
+    check pssh -h slaves -l root -t 1000000000000 "/var/lib/jenkins/workspace/FT-LTRX/utilities ft-bootstrap"
+
+  #done
+
+  logpop
+}
+
+function ft-rsync ()
+{
+  logpush ft-rsync
+
+  have-file-or-fail slaves
+  have-cmd-or-fail rsync
+
+  local self=$(hostname -s)
+
+  for line in $(cat slaves)
+  do
+
+    local targ=$(echo ${line} | cut -d @ -f 2)
+
+    if [ "${self}" == "${targ}" ]
+    then
+
+      logmsg "Skip ${targ} (self)"
+
+    else
+
+      logmsg "Sync ${targ}"
+      check ssh jenkins@${targ} "mkdir -p /var/lib/jenkins/workspace/FT-LTRX"
+      check rsync --progress --delete --times --perms --links --update -r . "jenkins@${targ}:/var/lib/jenkins/workspace/FT-LTRX"
+
+    fi
+
+  done
+
+  logpop
+}
+
+function gdk-pixbuf-loader ()
+{
+  if [ -n "${HUGE_SVG}" ]; then
+     logpush gdk-pixbuf-loader
+     
+     source config/ltrx.env
+     if [ ! -z "${GDK_PIXBUF_LOADER}" ] && [ ! -z "${GDK_PIXBUF_MODULE_FILE}" ]; then
+       logmsg "Generating  ${GDK_PIXBUF_MODULE_FILE}"
+       eval ${GDK_PIXBUF_LOADER} --update-cache
+     fi
+  fi
+}
+
+# Initialize a ft context for pre run validation
+function ft-prologue ()
+{
+  logpush $(basename "${WORKDIR}")/run
+  logmsg "Preparing for test execution"
+
+  logpush ft-prologue
+  pud "${WORKDIR}"
+
+  detect-gst-version
+
+  # first thing is to make sure mongo is running
+  mongo-start-all
+
+  have-file-or-fail "config" " - Must be called from a case context."
+
+  if [ "${OS}" == "Ubuntu" ]; 
+  then
+    if ! have-cmd vantrxengine
+    then
+      base=/opt/spotxde
+      # when using ltrx from a .deb package on ubuntu, we need to set some path so the run script can access gi/gl/analyser/etc
+      # This is all provide from the ltrx .deb file instead of many ones
+      export           GST_PLUGIN_PATH="${base}/lib/ltrx/gstreamer-1.0"
+      #export              GST_REGISTRY="/home/lmmv1/lmmv_src/svn/LTRX-FT/cases/BWO-233/config/registry-ltrx.x86_64.bin"
+      export       GST_REGISTRY_UPDATE="yes"
+      export           LD_LIBRARY_PATH="${base}/lib/ltrx:${base}/lib/ltrx/gstreamer-1.0:${base}/share/ltrx/parsers/"
+      export        LIBVA_DRIVERS_PATH="${base}/lib/ltrx"
+      export                     MAGIC="${base}/share/ltrx/magic"
+      export                      PATH="${base}/tools/bin:${PATH}"
+      export              SPOTXDE_MIME="${base}/share/ltrx/mimeTypeDB.xml"
+      export    VANTRIX_MI_PARSER_PATH="${base}/share/ltrx/parsers/"
+    fi
+  fi
+
+  have-cmd-or-fail "gl" " - gst-launch from van gstreamer package or wrapper"
+  have-cmd-or-fail "gi" " - gst-inspect from van gstreamer package or wrapper"
+
+  if [ "${OS}" == "Ubuntu" ]; 
+  then
+    check-deb-not-running
+  fi
+
+  # Stop the ltrx if it's running
+  ltrx-alive && ltrx-stop
+
+  # Stop any prior gst
+  #logmsg("stoping any running gst-lauch or gl, valgrind, streamingserver")
+  killall gl gst-launch-0.10 gst-launch-1.0 &> /dev/null
+  killall -g vangrind &> /dev/null
+  killall -g valgrind &> /dev/null
+  killall vanstreamingserver &> /dev/null
+
+  # Delete prior sessions
+  find /tmp/ -type f -name "sess*" -delete 2>/dev/null
+  find /tmp/ -type f -name "stat*" -delete 2>/dev/null
+  find /tmp/ -type f -name "LogMem*" -delete 2>/dev/null
+
+  rm -f ${WORKDIR}/config/session-*.png
+  rm -rf ${WORKDIR}/config/session-*.dot
+  rm -f ${WORKDIR}/config/loaders.cache
+
+  local addr=($(mongo-address))
+
+  if have-file core
+  then
+
+      local prog=$(core-get-prog core)
+      local arch=./config/core-$(basename ${prog})
+
+      logmsg "Archiving core dump to ${arch}"
+      mv -f ./core ${arch}
+  fi
+
+  if have-file config/mongo-populate && [ ${addr[0]} == "$(hostname)" ]
+  then
+    logmsg "Start database"
+    mongo-start-all
+  fi
+
+  for f in $(find config -type f -name "*.t" | sort)
+  do
+    local t=$(echo "${f}" | sed -e "s|\.t$||")
+
+    if have-file ${t}
+    then
+      logmsg "Backup templated ${t}"
+      check cp -f ${t} ${t}.bak
+    fi
+
+
+    logmsg "Initialize template ${t}"
+    check touch "${t}"
+    sed \
+      -e "s|%ROOT%|${WORKDIR}|g" \
+      -e "s|%DBADDR%|${addr[0]}|g" \
+      -e "s|%DBPORT%|${addr[1]}|g" \
+      -e "s|%DBNAME%|${addr[2]}|g" \
+      "${f}" > "${t}"
+
+  done
+
+  for f in ltrx rmss
+  do
+
+    if have-file config/${f}.env
+    then
+      logmsg "Backup runtime environment [${f}]"
+      check cp -f config/${f}.env config/${f}.env.bak
+    fi
+
+    logmsg "Create runtime environment [${f}]"
+    check touch config/${f}.env
+    check chmod +x config/${f}.env
+    # another dynamic function naming :( this will call ltrx-env and rmss-env
+    ${f}-env > config/${f}.env
+
+  done
+
+  check sed -e "s|:/|:\\\\\n/|g" -i config/*.env
+  
+  # ASP-1262: possibly need to setup for huge svg
+  ${WORKDIR}/utilities gdk-pixbuf-loader
+
+  ft-medias
+
+  mongo-disable-authentication-ifenable
+
+  if have-file config/mongo-populate
+  then
+    logmsg "Populate database"
+    mongo-populate
+
+    logmsg "Save database state"
+    mongo-db-backup mongo/before
+    ltrx-config db-services-url-list "mongo://${addr[0]}:${addr[1]}"
+    ltrx-config db-services-name "${addr[2]}"
+  else
+    logmsg "Clear database"
+    ltrx-config db-services-url-list ""
+  fi
+
+  if have-file core
+  then
+    logmsg "Deleting existing core dump"
+    check rm -f core
+  fi
+
+  if have-file config/ltrx.log
+  then
+    logmsg "Backup existing log"
+    check cp -f config/ltrx.log config/ltrx.log.bak
+    echo -e "" > config/ltrx.log
+  fi
+
+  core-dump-init
+
+  logpop
+
+  export __ft_prologued=true
+}
+
+# Prepares the ft to run, replaces templates, configures and populates
+function ft-setup ()
+{
+  logmsg "Initializing test execution"
+  logpush ft-setup
+
+  if [ -z "${__ft_prologued}" ]
+  then
+
+    ft-prologue "${@}"
+
+  fi
+
+  logmsg "Launch ltrx"
+  ltrx-start "${@}" ||
+  ft-failure
+
+  logmsg $(pgrep vantrxengine)
+
+  logpop
+
+  # Initialize FT result
+  export __ft_result=true
+
+  # Disable exit on failure
+  export FAIL_ACTION=return
+}
+
+# Use tcpdump with timeout to verify there is no data
+# on the dst and port range.
+# ${1} : timeout seconds
+# ${2} : dst ip
+# ${3} : port min
+# ${4} : port max
+function check-no-data-dst-port-range ()
+{
+   local timeout=$1
+   local dst=$2
+   local port_min=$3
+   local port_max=$4
+
+   for ((port=${port_min};port<=${port_max};++port));
+   do
+     local port_cmd="${port_cmd} ${port}"
+   done
+   check-no-data-dst-port-list ${timeout} ${dst} ${port_cmd}
+}
+
+# Use tcpdump with timeout to verify there is no data
+# on the dst and ports. fail if data is detected. Useful
+# as a way to make sure there is no other device using a list
+# of port before testing
+# ${1} : timeout seconds
+# ${2} : dst ip
+# ${@} : ports
+function check-no-data-dst-port-list ()
+{
+   logpush check-no-data-dst-port-list
+   local timeout=${1}
+   local dst=${2}
+   local port_cmd="port ${3}"
+   local first_port=${3}
+   shift 3
+   local port
+   for port in ${@}
+   do
+     local port_cmd="${port_cmd} or port ${port}"
+   done
+
+   logmsg "Checking there is no packet received on dst ${dst} and port(s) :${first_port} ${@}"
+   tcpdump-timeout ${timeout} "tcpdump -w /dev/null -i eth0 dst ${dst} and ${port_cmd}"
+   local num_packet=$?
+   if [ ${num_packet} -ne 0 ]; then
+      logmsg "Error : we have received ${num_packet} packets on ${dst} port(s) ${first_port} ${@}"
+      ft-failure
+   fi
+   logpop
+}
+
+# Allow calling tcpdump with a timeout. return the number of
+# packet captured. You may use any option to tcpdump but it is
+# recommended to at least use "-w /dev/null" to make it more efficient
+# first argument is the timout in second. next is the whole tcpdump command in quote ""
+function tcpdump-timeout ()
+{
+  logpush tcpdump-timeout
+
+  local num_pkt=0
+  local out_log=$(mktemp)
+  rm -f ${out_log}
+  local out=`timeout $1 $2 &> ${out_log}`
+  grep "packets captured" ${out_log} &> /dev/null
+  if [ ${?} -eq 0 ]; then
+    local num_pkt=`grep "packets captured" ${out_log} | awk '{print $1}'`
+  fi
+  rm -f ${out_log}
+
+  logpop
+  return ${num_pkt}
+}
+
+
+# launch a gstreamer pipeline receive in argument
+# it accept caps with quote.
+# if a failure occurs, display the pipeline to user.
+# ${1} : timeout in second
+# ${2} : pipeline
+# return 0 on success
+function gstreamer-launcher ()
+{
+  logpush gstreamer-launcher
+
+  local success
+  local timeout_val=${1}
+  shift 1
+  local pipeline=$(mktemp)
+  # pipeline containing quotes create problem in bash. run from file
+  local pipeline_cmd="${1}"
+
+  echo "${pipeline_cmd}" > ${pipeline}
+
+  chmod +x ${pipeline}
+  timeout "${timeout_val}" ${pipeline} &> /dev/null
+
+  local success=$?
+  if [ ${success} -ne 0 ]; then
+    if [ ${success} -eq 124 ]; then
+      logmsg "Timeout of gstreamer cmd : ${pipeline_cmd}"
+    else
+      logmsg "Error running gstreamer cmd : ${pipeline_cmd}"
+    fi
+  fi
+
+  rm -f ${pipeline}
+  logpop
+  return ${success}
+}
+
+# Similar to gstreamer-launcher but takes a file that is readily made
+# for the pipeline
+function gst-run-file ()
+{
+  logpush gst-run-file
+
+  local timeout=${1}
+  local pipe=${2}
+
+  not-empty-or-fail "${timeout}" "Usage : gst-run-file <timeout> <pipeline file>"
+  have-file-or-fail "${pipe}" "Cannot find requested pipeline file ${pipe}"
+
+  chmod +x "${pipe}"
+
+  timeout "${timeout}" "${pipe}" 2> config/gst-run-file.log 1> /dev/null
+
+  local res=${?}
+
+  if [ "${res}" != 0 ]
+  then
+
+    if [ "${res}" == 124 ]
+    then
+
+      logmsg "Timeout occured during execution of pipeline"
+
+    else
+
+      logmsg "Some unexpected error occured during execution of pipeline"
+      cat config/gst-run-file.log
+
+    fi
+
+    failure "GStreamer pipeline failed"
+
+  fi
+
+  logpop
+}
+
+
+# Try to get the specified sdp name on local ltrx
+# up to timeout time. The test will fail IF the sdp is PRESENT.
+# This is useful when you know that a given service should
+# fail for various reason
+# ${1} : sdp name
+# ${2} : timeout (sec)
+function sdp-not-present-verification ()
+{
+  logpush sdp-not-present-verification
+
+  local success=0
+  local sdp_name=${1}
+  local timeout=${2}
+  rm -f ${sdp_name}
+
+  logmsg "Trying to get sdp ${sdp_name} from LTRX"
+  # wait timeout sec until we get the sdp file from the ltrx http server
+  for ((i=0;i<=timeout;++i));
+  do
+     wget localhost:8090/${sdp_name} &> /dev/null
+     if [ ${?} -eq 0 ]; then
+        logmsg "Able to get the sdp, not supposed too"
+        success=-1
+        break;
+     fi
+     sleep 1
+  done
+
+  rm -f ${sdp_name}
+
+  if [ ${success} -eq 0 ]; then
+     logmsg "Success (sdp file not present, as expected)"
+  else
+     ft-failure "Failed"
+  fi
+  logpop
+}
+
+# internal function.
+# construct and run a pipeline for an rtp stream
+# return a status
+function internal-rtp-pipeline ()
+{
+  logpush internal-rtp-pipeline
+
+  local timeout=${1}
+  local num_frame=${2}
+  local stream_type=${3}
+  local ip_dst=${4}
+  local port=${5}
+  local pt=${6}
+  local codec=${7^^} # Codec in upper cases
+  local rate=${8}
+  local operation=${9}
+  local dec=""
+  local depay=""
+  local operation_cmd=""
+
+  [ ${num_frame} -eq 1 ] && num_frame=2
+
+  [[ ${codec} == *MP4A* ]] && dec=vanaacdec && depay=rtpmp4adepay
+  [[ ${codec} == *H264* ]] && dec=avdec     && depay=rtph264depay
+  [[ ${codec} == *H263* ]] && dec=avdec     && depay=rtph263depay
+  [[ ${codec} == *H265* ]] && dec=avdec     && depay=rtph265depay
+  [[ ${codec} == *MP4V* ]] && dec=avdec     && depay=rtpmp4vdepay
+  [[ ${codec} == *VP8* ]]  && dec=vp8dec    && depay=rtpvp8depay
+  [[ ${codec} == *OPUS* ]] && dec=opusdec  && depay=rtpopusdepay
+
+  if [ ${operation} == "depay" ]
+  then
+    operation_cmd="! ${depay}"
+  elif [ "${operation}" == "decode" ]
+  then
+    operation_cmd="! ${depay} ! ${dec}"
+  fi
+
+  cat > config/gst-pipe << EOF
+#!/bin/bash
+config/ltrx.env gl \\
+  --gst-debug-level=2 \\
+  udpsrc \\
+    uri=udp://${ip_dst}:${port} \\
+    initial-timeout=${timeout} \\
+    active-timeout=${timeout} \\
+! application/x-rtp, \\
+    media=${stream_type}, \\
+    encoding-name=${codec}, \\
+    payload=${pt}, \\
+    clock-rate=${rate} \\
+${operation_cmd}  \\
+! vanmediacontrol frameStop=${num_frame} \\
+! fakesink
+
+EOF
+
+
+  gst-run-file ${timeout} config/gst-pipe
+  logpop
+}
+
+# internal function
+# parse the sdp stream number information from an sdp file
+# call function to check that stream via pipeline construction
+# return success or fail
+function internal-check-sdp-stream ()
+{
+  logpush internal-check-sdp-stream
+
+  local sdp_name=${1}
+  local timeout=${2}
+  local num_frame=${3}
+  local stream_type=${4}
+  local stream_num=${5}
+  local operation=${6}
+
+  not-empty-or-fail "${operation}" "Usage : internal-check-sdp-stream <sdp_name> <timeout> <num_frame> <stream_type> <stream_num> <operation>"
+  not-empty-or-fail "${stream_num}" "Missing stream_num"
+  not-empty-or-fail "${stream_type}" "Missing stream_type"
+  not-empty-or-fail "${num_frame}" "Missing num_frame"
+  not-empty-or-fail "${timeout}" "Missing timeout"
+  not-empty-or-fail "${sdp_name}" "Missing sdp_name"
+
+  local ip_dst=$(awk "/c=IN/{print}" ${sdp_name} | awk '{print $3}' | tr -d "\r")
+  local port=$(awk "/m=${stream_type}/{i++}i==${stream_num}{print;exit}" ${sdp_name} | awk 'BEGIN { FS="[/ ]" } {print $2}')
+  local pt=$(awk "/m=${stream_type}/{i++}i==${stream_num}{print;exit}" ${sdp_name} | awk 'BEGIN { FS="[/ ]" } {print $5}' | tr -d "\r")
+  local codec=""
+  local rate=""
+
+  not-empty-or-fail "${ip_dst}" "Missing ip_dst : awk '/c=IN/{print}' ${sdp_name}"
+  not-empty-or-fail "${port}" "Missing port : awk '/m=${stream_type}/{i++}i==${stream_num}{print;exit}' ${sdp_name}"
+  not-empty-or-fail "${pt}" "Missing pt : awk '/m=${stream_type}/{i++}i==${stream_num}{print;exit}' ${sdp_name}"
+
+  codec=$(awk "/a=rtpmap:${pt}/{i++}i==${stream_num}{print;exit}" ${sdp_name} | awk 'BEGIN { FS="[/ ]" } {print $2}')
+  rate=$(awk "/a=rtpmap:${pt}/{i++}i==${stream_num}{print;exit}"  ${sdp_name} | awk 'BEGIN { FS="[/ ]" } {print $3}')
+
+  not-empty-or-fail "${codec}" "Missing codec : awk '/a=rtpmap:${pt}/{i++}i==${stream_num}{print;exit}' ${sdp_name}"
+  not-empty-or-fail "${rate}" "Missing rate : awk '/a=rtpmap:${pt}/{i++}i==${stream_num}{print;exit}'  ${sdp_name}"
+
+  internal-rtp-pipeline "${timeout}" "${num_frame}" "${stream_type}" "${ip_dst}" "${port}" "${pt}" "${codec}" "${rate}" "${operation}"
+
+  logpop
+}
+
+# read the specified sdp name on the local ltrx
+# parse the audio/video section and run a pipeline on all audio
+# and video stream. attempt to depayload and decode.
+# succed when the number of packet is reached.
+# ${1} : sdp name
+# ${2} : timeout (sec)
+# ${3} : num frame to wait for (for audio and video decode)
+# ${4} : operation ("udp", "depay" or "decode"
+# return 0 on success
+function sdp-stream-verification ()
+{
+  logpush sdp-stream-verification
+
+  local success=false
+  local sdp_name=${1}
+  local timeout=${2}
+  local num_frame=${3}
+  local operation=${4}
+
+  rm -f ${sdp_name}
+
+  logmsg "Trying to get sdp ${sdp_name} from LTRX"
+
+  # wait timeout sec until we get the sdp file from the ltrx http server
+  for ((i = 0; i <= timeout; ++ i))
+  do
+    wget -o config/wget.log http://localhost:8090/${sdp_name} &&
+    break
+    sleep 1
+  done
+
+  have-file-or-fail ${sdp_name}
+
+  local num_audio=$(grep -c -e "m=audio" ${sdp_name})
+  local num_video=$(grep -c -e "m=video" ${sdp_name})
+
+  logmsg "Will validate ${num_audio} audio and ${num_video} video streams"
+
+  for ((i = 1; i <= num_audio; ++ i))
+  do
+    internal-check-sdp-stream ${sdp_name} ${timeout} ${num_frame} audio ${i} ${operation} ||
+    return 1
+  done
+
+  for ((i = 1; i <= num_video; ++ i))
+  do
+    internal-check-sdp-stream ${sdp_name} ${timeout} ${num_frame} video ${i} ${operation} ||
+    return 1
+  done
+
+  logpop
+}
+
+# Attempt to demux mpegts frame (any kind) at IP:port.
+# succed when the number of packet is reached.
+# ${1} : IP
+# ${2} : PORT
+# ${3} : timeout (sec)
+# ${4} : num frame to wait for (for audio and video decode)
+# return 0 on success
+function mpegts-stream-verification ()
+{
+  logpush mpegts-stream-verification
+
+  local ip_dst=${1}
+  local port=${2}
+  local timeout=${3}
+  local num_frame=${4}
+
+  logmsg "Demuxing ${num_frame} mpegts frame on udp://${ip_dst}:${port}"
+  # NOTE : Active timeout is set to 5s instead of 1 because of bug BWO-7110
+  gstreamer-launcher ${timeout} "gl udpsrc uri=udp://${ip_dst}:${port} initial-timeout=${timeout} active-timeout=5 ! ${TSDEMUX} ! vanmediacontrol frameStop=${num_frame} ! fakesink"
+  local success=$?
+  if [ ${success} -eq 0 ]; then
+     logmsg "Success"
+  else
+     ft-failure "Failed"
+  fi
+  logpop
+}
+
+# Attempt to decode mpegts frame at IP:port.
+# succed when the number of packet is reached.
+# ${1} : IP
+# ${2} : PORT
+# ${3} : timeout (sec)
+# ${4} : num frame to wait for (for audio and video decode)
+# ${5} : pad name (as per analyser)
+# ${6} : decoder name (gst name)
+# return 0 on success
+function mpegts-stream-decode ()
+{
+  logpush mpegts-stream-decode
+
+  local ip_dst=${1}
+  local port=${2}
+  local timeout=${3}
+  local num_frame=${4}
+  local pad_name=${5}
+  local decoder=${6}
+
+  logmsg "Decoding ${num_frame} mpegts frame with ${decoder} (pad=${pad_name}) on udp://${ip_dst}:${port}"
+
+  # NOTE : Active timeout is set to 5s instead of 1 because of bug BWO-7110
+  gstreamer-launcher ${timeout} "gl udpsrc uri=udp://${ip_dst}:${port} initial-timeout=${timeout} active-timeout=5 ! ${TSDEMUX} ${pad_name} ! ${decoder} ! vanmediacontrol frameStop=${num_frame} ! fakesink"
+
+  local success=$?
+  if [ ${success} -eq 0 ]; then
+     logmsg "Success"
+  else
+     ft-failure "Failed"
+  fi
+  logpop
+}
+
+
+
+
+# Captures using tcpdump with timeout
+# ${1} : host filter
+# ${2} : port filter
+# ${3} : timeout in seconds
+# ${*} : additional tcpdump arguments
+# Prints number of packets
+function capture-get-count ()
+{
+  logpush capture-get-count
+
+  local ip="${1}"
+  local port="${2}"
+  local timeout="${3}"
+  shift 3
+
+  not-empty-or-fail "${timeout}" "Usage : capture-get-count <ip> <port> <timeout>"
+
+  local __tmp=$(mktemp)
+  timeout "${timeout}" tcpdump -q host "${ip}" and port "${port}" "${@}" &> ${__tmp} ||
+  {
+    logmsg "Capture details"
+    cat ${__tmp} 1>&2
+    failure "Failure occured while capturing"
+  }
+
+  local count=$(tail -n 3 ${__tmp} | grep -e " captured$" | cut -d " " -f 1)
+  not-empty-or-fail "${count}" "Failed to get count from ${__tmp}"
+  check rm -f ${__tmp}
+  echo -e "${count}"
+
+  logpop
+}
+
+# Get a packet from udp using a GStreamer pipeline
+# ${1} : host filter
+# ${2} : port filter
+# ${3} : timeout in seconds
+function gst-udp ()
+{
+  gst-udp-cap ${@} 1 /dev/null
+}
+
+# Capture an UDP stream and write it to file
+# ${1} : host filter
+# ${2} : port filter
+# ${3} : timeout in seconds
+# ${4} : capture packets
+# ${5} : output file
+function gst-udp-cap ()
+{
+  local output=${5}
+  if [ ${output} != "/dev/null" ]; then
+     output=${5}-gl.log
+  fi
+  gl udpsrc uri=udp://${1}:${2} initial-timeout=${3} active-timeout=${3} num-buffers=${4} ! filesink location=${5} &> ${output}
+}
+
+# Capture a range of ports from UDP
+# ${1} : host filter
+# ${2} : timeout in seconds
+# ${3} : capture packets
+# ${4} : output file prefix, appended with port number
+# ...  : ports to capture
+# Returns success if all ports had data
+function gst-udp-list ()
+{
+  logpush gst-udp-list
+  local host=${1}
+  local time=${2}
+  local dura=${3}
+  local outp=${4}
+
+  shift 4
+
+  local tmp=$(mktemp)
+
+  cat > ${tmp} << EOF
+#!/bin/bash
+
+source ${WORKDIR}/utilities
+
+for port in ${@}
+do
+  gst-udp-cap ${host} \${port} ${time} ${dura} "${outp}-\${port}" &
+done
+
+wait
+
+EOF
+
+  chmod +x ${tmp}
+  ${tmp}
+  rm -f ${tmp}
+
+  logpop
+}
+
+function gst-udp-range ()
+{
+  logpush gst-udp-range
+
+  not-empty-or-fail ${6}
+
+  local port
+  local ports
+
+  for ((port=${5}; port <= ${6}; ++port))
+  do
+    ports="${ports} ${port}"
+  done
+
+  gst-udp-list ${1} ${2} ${3} ${4} ${ports}
+
+  logpop
+}
+
+# copy all .json service from a folder to the services folder
+# cleaning all other service from that folder
+# ${1} : folder where to get the service
+function install-services ()
+{
+   logpush install-services
+   local folder=${1}
+   rm services/*.json services/*.xml -f
+   cp config/${folder}/*.json services/
+   logmsg "installing service from config/${folder}"
+   logpop
+}
+
+
+# Generate a blackout file for testing. Based on generate_blackout2.sh in
+# http://172.16.133.114/svn/vantrix/trunk/SPOTxdeLIVE/Tools/Testing/Sherbrooke_soak
+#
+# ${1} : interval (in minutes)
+# ${2} : channel_name
+# ${3} : output file path
+#
+function blackout-gen-today ()
+{
+   local date_today=`date +%F`
+   local increment=${1}
+   local channel_name=${2}
+   local output_file=${3}
+   blackout-gen ${date_today} ${increment} ${channel_name} ${output_file}
+}
+
+# Generate a blackout file for testing. Based on generate_blackout2.sh in
+# http://172.16.133.114/svn/vantrix/trunk/SPOTxdeLIVE/Tools/Testing/Sherbrooke_soak
+#
+# ${1} : date ex: 2014-05-29
+# ${2} : interval (in minutes)
+# ${3} : channel_name
+# ${4} : output file path
+#
+function blackout-gen ()
+{
+   local date_=${1}
+   local increment=${2}
+   local channel_name=${3}
+   local output_file=${4}
+   local start_hour=0
+   local stop_hour=23
+
+   local incrementx2=0
+   local max_minute=0
+   local hour=0
+   local minute=0
+   local minute_plus=0
+
+   let incrementx2=increment*2
+   let max_minute=59-increment
+
+
+   # echo the file header
+   echo "${channel_name};1;ref1;\"Patof leclown\"" > ${output_file}
+   echo "${date_};00:00;${date_};${stop_hour}:59" >> ${output_file}
+
+
+   for hours in `seq ${start_hour} ${stop_hour}`;
+   do
+      for minutes in `seq 0 ${incrementx2} ${max_minute}`
+      do
+         let minute_plus=${minutes}+${increment}
+         hour=`printf %02d ${hours}`
+         minute=`printf %02d ${minutes}`
+         minute_plus=`printf %02d ${minute_plus}`
+         echo "${date_};${hour}:${minute};${date_};${hour}:${minute_plus}" >> ${output_file}
+         #let minute_plus=${minutes}+${increment}
+      done
+   done
+
+}
+
+function ft-capture ()
+{
+  logpush ft-capture
+  logmsg "Capturing packets using ${@}"
+
+  count=$(capture-get-count "${@}")
+  [ -z "${count}" ] && ft-failure "Failed to capture"
+  ((count==0)) && ft-failure "Captured no packets"
+
+  logmsg "Captured ${count} packets"
+  logpop
+}
+
+
+function ft-check ()
+{
+  logpush "${1}"
+
+  "${@}" ||
+  ft-failure "Error on ${@}"
+
+  logpop
+}
+
+function ft-check-gpu ()
+{
+  logpush "gpu"
+
+  gi vanimstrx &> /dev/null ||
+  ft-failure "Error - GPU not available"
+
+  logpop
+}
+
+function ft-must-fail ()
+{
+  logpush "ft-must-fail ${1}"
+  
+  # if this function is called to check another function (like wait-for-file)
+  # we must prevent that function to "fail" for real
+  
+  # Disable exit on failure and save current error code
+  export FAIL_ACTION=return
+  local current_ret=${RET_VALUE}
+  local orig_fail_action=${FAIL_ACTION}
+
+  "${@}" &> /dev/null &&
+  ft-failure "Unexpected success on ${@}"
+
+  # Restore exit on failure and error code
+  RET_VALUE=${current_ret}
+  export FAIL_ACTION=${orig_fail_action}
+
+  logpop
+}
+
+function ft-failure ()
+{
+  logmsg "${@}"
+  export __ft_result=false
+  ltrx-dump
+  ft-teardown
+  exit ${RET_VALUE}
+}
+
+# Params is list of folders
+function ft-checksum ()
+{
+  logpush ft-checksum
+  local file_list
+
+  if [ ! -z "$1" ]
+  then
+    file_list="$@"
+  elif [ -d "medias/output" ]
+  then
+    file_list="medias/output/"
+  fi
+
+  if have-file config/${CHECKSUM_FILE}
+  then
+    logmsg "Testing output ${CHECKSUM_FILE}"
+    ft-check md5sum -c config/${CHECKSUM_FILE}
+  elif [ ! -z "$file_list" ]
+  then
+    logmsg "Generate output checksum for folders: $file_list"
+    md5sum $(find $file_list -type f | sort) > config/${CHECKSUM_FILE}
+    svn add config/${CHECKSUM_FILE} &> /dev/null
+  fi
+
+  logpop
+}
+
+function ft-checksum-reset ()
+{
+  logpush ft-checksum
+
+  if have-file config/${CHECKSUM_FILE}
+  then
+
+    logmsg "Remove old ${CHECKSUM_FILE} file..."
+    rm -f config/${CHECKSUM_FILE}
+    ./run
+    ft-checksum
+    svn diff
+
+  else
+
+    logmsg "Search for test cases with ${CHECKSUM_FILE} file..."
+    for c in $(find ${WORKDIR} -type f -name ${CHECKSUM_FILE} | sort -u)
+    do
+
+      pud $(dirname $(dirname ${c}))
+      ft-checksum-reset
+      pod
+
+    done
+
+  fi
+
+  logpop
+}
+
+
+EXPECTED_PAD=0
+EXPECTED_BUFFER=0
+EXPECTED_ELEMENT=0
+EXPECTED_EVENT=0
+function checkLeak()
+{
+    ele=$(cat config/ltrx.log | grep "Gst buffer" | sed s/.*Gst// | awk -v offset=$1 '{ print $offset }' | cut -f 2 -d '=')
+    if ! [ -z $ele ] && [ $ele -gt 0 ] ; then
+        memError=1;
+        logmsg "There is a leak: $ele $2 remain."
+    fi
+}
+function checkLeakLt()
+{
+    ele=$(cat config/ltrx.log | grep "Gst buffer" | sed s/.*Gst// | awk -v offset=$1 '{ print $offset }' | cut -f 2 -d '=')
+    if ! [ -z $ele ] && [ $ele -gt $3 ] ; then
+        memError=1;
+        logmsg "There is a leak: $ele $2 remain, expecting $3."
+    fi
+#    eleOri=$(cat $1 | head -n 2 | tail -n 1 | awk -v offset=$2 '{print $offset}' | sed s/,//)
+}
+
+function ft-teardown ()
+{
+  logpush ft-teardown
+  pud "${WORKDIR}"
+
+  if have-file config/mongo-populate
+  then
+
+    logmsg "Save database state"
+    mongo-db-backup mongo/after
+
+  fi
+
+  junit-result
+  ltrx-state
+
+  if ! ${__ft_result}
+  then
+    logmsg "Dump ltrx"
+    ltrx-dump
+  fi
+
+  logmsg "Stop ltrx"
+  ltrx-stop
+
+  MINIPPID=$(minio-pid)
+  if [ ! -z ${MINIPPID} ]
+  then
+    minio-stop
+  fi
+
+  if have-file config/mongo-populate
+  then
+
+    # Start the mongos if they are down
+    mongo-start-all
+
+    logmsg "Save database state"
+    mongo-db-backup mongo/finished
+
+  fi
+
+  # Check test result
+  if ! ${__ft_result}
+  then
+
+    if have-file config/ltrx.log
+    then
+      logmsg "Errors in log"
+      grep -i \
+        -e "| ERROR   |" \
+        config/ltrx.log
+    fi
+
+    failure "Test failed"
+
+  else
+
+    # Check for Gst elements still allocated.
+    memError=0;
+    #memfile=`ls -t /tmp/LogMem* | head -n 1` > /dev/null;
+    if [ -z $DISABLE_MEMCHECK ] && [ -z $VALGRIND ] ;
+    then
+      checkLeakLt 1 buffer $EXPECTED_BUFFER
+      checkLeakLt 2 event $EXPECTED_EVENT
+      checkLeak 3 msg
+      # These value increase and are not released.
+      # Disable the check for FT test.
+      #checkLeakLt $memfile 4 struct
+      #checkLeakLt $memfile 5 caps
+      checkLeak 6 query
+      checkLeak 7 segment
+      checkLeakLt 8 pad $EXPECTED_PAD
+      checkLeakLt 9 element $EXPECTED_ELEMENT
+
+      if [ $memError -gt 0 ] ;
+      then
+        failure "Test Failure : Gst memory leak detected"
+      fi
+    fi
+
+    if ! [ -z $VALGRIND ] ;
+    then
+       defLost=`grep "are definitely" valgrind_report | wc -l`
+       uninit=`grep "on uninitialised" valgrind_report | wc -l`
+
+       if [ $defLost -gt 0 ] || [ $uninit -gt 0 ] ;
+       then
+         failure "Test Failure : Valgrind memory leak detected"
+         memError=1
+       fi
+    fi
+
+    if [ $memError -eq 0 ] ;
+    then
+      command -v svn >/dev/null && 
+      {
+        REM=$(svn status --no-ignore "medias" 2>/dev/null | grep -e "^[\!\?I] " | awk '{ print $2 }')
+
+	if [ "${GST_VERSION}" == "0.10" ]; then
+          if [ ! -z "${REM}" ]; then
+            rm -vrf ${REM}
+          fi
+        fi
+      }
+
+      logmsg "Test succeeded"
+
+    fi
+  fi
+
+  # Reset permissions on registry file
+  chmod 664 config/registry*.bin
+
+  # Stop any stuck gst
+  killall gl gst-launch-${GST_VERSION} &> /dev/null
+  killall vangrind &> /dev/null
+  killall valgrind &> /dev/null
+  killall vanstreamingserver &> /dev/null
+
+  mongo-disable-authentication-ifenable
+
+  pod
+  logpop
+  logpop
+}
+
+# Delete anything that is unversioned
+function ft-clean ()
+{
+  logpush ft-teardown
+  pud "${WORKDIR}"
+
+  have-cmd-or-fail svn
+  check svn --version
+  local rem=$(svn status --no-ignore 2> /dev/null | grep -e "^[\!\?I] " | awk '{ print $2 }')
+
+  if [ ! -z "${rem}" ]; then
+    check rm -vrf ${rem}
+  fi
+
+  pod
+  logpop
+}
+
+function ft-clean-all ()
+{
+  logpush ft-clean-all
+
+  have-file-or-fail slaves
+
+  for line in $(cat slaves)
+  do
+
+    local targ=$(echo ${line} | cut -d @ -f 2)
+
+    logmsg "Clean ${targ} ..."
+    check ssh root@${targ} "/var/lib/jenkins/workspace/FT-LTRX/utilities ft-clean"
+
+  done
+
+  logpop
+}
+
+
+
+# Compress a FT as tgz
+function ft-package ()
+{
+  logpush ft-package
+  pud "${WORKDIR}"
+
+  have-file-or-fail run "Must be run from within a test case ..."
+  pud ..
+
+  local case=$(basename ${WORKDIR})
+  local out=${HOME}/${case}.tgz
+
+  logmsg "Archiving into ${out}"
+  check tar -h -z -c -f ${out} ${case}
+
+  pod
+  pod
+  logpop
+}
+
+# Set a route for the 224 multicast group to go on loopback
+function loopback-mc-route-on ()
+{
+  logpush loopback-mc-route-on
+  ifconfig lo multicast
+  route add -net 224.0.0.0 netmask 255.0.0.0 dev lo
+  cat > /etc/sysconfig/network-scripts/route-lo << EOF
+224.0.0.0/8 dev lo
+EOF
+  logpop
+}
+
+# Remove the multicast route
+function loopback-mc-route-off ()
+{
+  logpush loopback-mc-route-off
+  route del -net 224.0.0.0 netmask 255.0.0.0 dev lo
+  rm -f /etc/sysconfig/network-scripts/route-lo
+  logpop
+}
+
+# show the summary of each test from the case folder
+function summary ()
+{
+  local list=`find -not -path "./templates/*" -name run`
+  for test in ${list}; do
+     local folder=$(basename $(dirname $test))
+     # show the line after "cat << EOF"
+     local summary=`cat ${test} | awk '/cat << EOF/{getline; print}'`
+     echo "${folder} : ${summary}"
+  done
+}
+
+function jenkins-update ()
+{
+  logpush jenkins-update
+  have-file-or-fail "${HOME}/jobs/FT-LTRX/config.xml"
+  have-file-or-fail "${WORKDIR}/templates/jenkins/config.xml"
+
+  logmsg "Updating jenkins jobs"
+  local deps
+  local split
+
+  local host=`hostname`
+  wget -q http://${host}:8080/jnlpJars/jenkins-cli.jar -O jenkins-cli.jar
+
+  cat >> script.groovy << EOF
+import hudson.model.labels.LabelExpression;
+import hudson.model.Label;
+import hudson.model.Node;
+label =  args[0]
+computer = ""
+Label labele = LabelExpression.parseExpression(label);
+for ( node in labele.getNodes() ) {
+  computer += node.getNodeName()+","
+}
+println(computer)
+EOF
+
+  for ft in $(ft-list)
+  do
+    unset DESAC_NO_LABEL
+    echo "Updating ${ft}"
+    check mkdir -p "${HOME}/jobs/FT-LTRX-1-${ft}"
+    check cp -vf "${WORKDIR}/templates/jenkins/config.xml" "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+    sed \
+      -e "s|%FT%|${ft}|g" \
+      -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+
+     #local DESC=`cat cases/${ft}/run | sed -n '/^cat/,/^EOF$/{/^cat.*$/d;/^EOF$/d;p;}' | sed -E ':a;N;$!ba;s/\r{0,1}\n/<\/title><br \/>/'| sed -E ':a;N;$!ba;s/\r{0,1}\n/<br \/>/g'`
+  
+    #sed \
+    #        -e "s@%DESC%@${DESC}@g" \
+    #        -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+    
+    if [[ ! -z "`grep -e "^#LABEL:" cases/${ft}/run`" ]]; then
+       labels=`grep -e "^#LABEL:" cases/${ft}/run | awk 'BEGIN {FS="LABEL:"}{print $2}'`
+       local fLabels="FT-LTRX&&(${labels})"
+
+       if [[ ! -z "`cat script.groovy | java -jar jenkins-cli.jar -s http://${host}:8080 groovy = \"${fLabels}\"`" ]]; then
+         fLabels=`echo $fLabels | sed 's/\&/\\\&amp;/g; s/</\\\&lt;/g; s/>/\\\&gt;/g; s/"/\\\&quot;/g; s/'"'"'/\\\&#39;/g'`
+         sed \
+            -e "s@%LABELS%@${fLabels}@g" \
+            -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+       else
+         DESAC_NO_LABEL=1
+       fi
+    else
+      sed \
+         -e "s@%LABELS%@FT-LTRX@g" \
+         -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+    fi
+
+    if [[ ! -z "`grep -e "^#BLOCKBUILD:" cases/${ft}/run`" ]]; then
+       blockedJobs=`grep -e "^#BLOCKBUILD:" cases/${ft}/run | awk 'BEGIN {FS="BLOCKBUILD:"}{print $2}'`
+       fBlockedJobs="^FT-LTRX-1-"`echo ${blockedJobs} | sed 's/,/\\\n^FT-LTRX-1-/g'`
+       if [ ! -z "${fBlockedJobs}" ]; then
+          SPACERS="      "
+          sed \
+             -e "s|<useBuildBlocker>false</useBuildBlocker>|<useBuildBlocker>true</useBuildBlocker>\n${SPACERS}<blockLevel>GLOBAL</blockLevel>\n${SPACERS}<scanQueueFor>BUILDABLE</scanQueueFor>\n${SPACERS}<blockingJobs>${fBlockedJobs}\n${SPACERS}</blockingJobs>|g" \
+             -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+       fi
+    fi
+
+    if [[ ! -z "`grep -e "^#DESAC" cases/${ft}/run`" || ${DESAC_NO_LABEL} -eq 1 ]]; then
+       sed \
+         -e "s|<disabled>false</disabled>|<disabled>true</disabled>|g" \
+         -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+       sed \
+         -e "s|<upstreamProjects>FT-LTRX-0-Launcher</upstreamProjects>|<upstreamProjects></upstreamProjects>|g" \
+         -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+       sed \
+         -e "s|<childProjects>FT-LTRX-0-Epilogue</childProjects>|<childProjects></childProjects>|g" \
+         -i "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml"
+    else
+       deps="${deps}${split}FT-LTRX-1-${ft}"
+       split=","
+    fi
+
+    #svn add --parents "${HOME}/jobs/FT-LTRX-1-${ft}/config.xml" >&/dev/null && echo Added to svn
+    #check svn propset svn:ignore "*" "${HOME}/jobs/FT-LTRX-1-${ft}"
+
+  done
+  rm -f jenkins-cli.jar
+  rm -f script.groovy
+
+  check mkdir -p "${HOME}/jobs/FT-LTRX-0-Launcher"
+  check cp -vf "${WORKDIR}/templates/jenkins/master.xml" "${HOME}/jobs/FT-LTRX-0-Launcher/config.xml"
+  check sed \
+    -e "s|%FT%|${deps[@]}|g" \
+    -i "${HOME}/jobs/FT-LTRX-0-Launcher/config.xml"
+
+  check mkdir -p "${HOME}/jobs/FT-LTRX-0-Epilogue"
+  check cp -vf "${WORKDIR}/templates/jenkins/epilogue.xml" "${HOME}/jobs/FT-LTRX-0-Epilogue/config.xml"
+  check sed \
+    -e "s|%FT%|${deps[@]}|g" \
+    -i "${HOME}/jobs/FT-LTRX-0-Epilogue/config.xml"
+
+  logmsg "Update complete"
+
+  logpop
+}
+
+function junit-result ()
+{
+  logpush junit-result
+  logmsg "Generate result"
+
+  __timer_b=$(date +%s)
+  local elapsed=$((__timer_b - __timer_a))
+
+  if ${__ft_result}
+  then
+    cat > config/result.xml << EOF
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites errors="0" failures="0" tests="1" time="${elapsed}">
+  <testsuite errors="0" failures="0" hostname="$(hostname)" id="0" name="FT-LTRX" package="testdb" tests="1" timestamp="$(date-iso)">
+    <testcase classname="testdb.directory" name="$(basename ${MONGODIR})" time="${elapsed}"/>
+  </testsuite>
+</testsuites>
+EOF
+  else
+    cat > config/result.xml << EOF
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites errors="1" failures="1" tests="1" time="${elapsed}">
+  <testsuite errors="1" failures="1" hostname="$(hostname)" id="0" name="FT-LTRX" package="testdb" tests="1" timestamp="$(date-iso)">
+    <testcase classname="testdb.directory" name="$(basename ${MONGODIR})" time="${elapsed}">
+      <failure message="Test failed" type="failure"/>
+    </testcase>
+  </testsuite>
+</testsuites>
+EOF
+  fi
+
+  logpop
+}
+
+# Tests weather mediaInfo properties are equal
+function mi-equal ()
+{
+  logpush mi-equal
+
+  not-empty-or-fail "${4}" "Usage : mi-equal <group> <property> <reference> <comparison>"
+  have-file-or-fail "${3}"
+  have-file-or-fail "${4}"
+
+  local ref=$(grep -e "^${1} .[ ]*${2} " "${3}" | awk '{ print $3 }')
+  local cmp=$(grep -e "^${1} .[ ]*${2} " "${4}" | awk '{ print $3 }')
+
+  not-empty-or-fail "${ref}" "Failed getting property ${1}.${2} from ${3}"
+  not-empty-or-fail "${cmp}" "Failed getting property ${1}.${2} from ${4}"
+
+  [ "${ref}" != "${cmp}" ] &&
+  failure "Error : MediaInfo property mismatch [${1}.${2}] Expected [${ref}] Actual [${cmp}]" ||
+  logmsg "Property match [${1}.${2}] Actual [${cmp}]"
+
+  logpop
+}
+
+# Tests whether mediaInfo properties are greater or equal
+function mi-greater-equal ()
+{
+  logpush mi-greater-equal
+
+  not-empty-or-fail "${4}" "Usage : mi-greater-equal <group> <property> <reference> <comparison>"
+  have-file-or-fail "${3}"
+  have-file-or-fail "${4}"
+
+  local ref=$(grep -e "^${1} .[ ]*${2} " "${3}" | awk '{ print $3 }')
+  local cmp=$(grep -e "^${1} .[ ]*${2} " "${4}" | awk '{ print $3 }')
+
+  not-empty-or-fail "${ref}" "Failed getting property ${1}.${2} from ${3}"
+  not-empty-or-fail "${cmp}" "Failed getting property ${1}.${2} from ${4}"
+
+  [ "$(echo "${cmp} < ${ref}" | bc)" == "1" ] &&
+  failure "Error : MediaInfo property not greater or equal [${1}.${2}] Reference [${ref}] Actual [${cmp}]" ||
+  logmsg "Property greater or equal [${1}.${2}] Reference [${ref}] Actual [${cmp}]"
+
+  logpop
+}
+
+
+function mi-has ()
+{
+  logpush mi-equal
+
+  not-empty-or-fail "${4}" "Usage : mi-has <group> <property> <value> <target>"
+  have-file-or-fail "${4}"
+
+  local ref="${3}"
+  local cmp=$(grep -e "^${1} .[ ]*${2} " "${4}" | awk '{ print $3 }')
+
+  not-empty-or-fail "${cmp}" "Failed getting property ${1}.${2} from ${4}"
+
+  [ "${ref}" != "${cmp}" ] &&
+  failure "Error : MediaInfo property mismatch [${1}.${2}] Expected [${ref}] Actual [${cmp}]" ||
+  logmsg "Property match [${1}.${2}] Actual [${cmp}]"
+
+  logpop
+}
+
+function mi-has-greater-equal ()
+{
+  logpush mi-equal
+
+  not-empty-or-fail "${4}" "Usage : mi-has <group> <property> <value> <target>"
+  have-file-or-fail "${4}"
+
+  local ref="${3}"
+  local cmp=$(grep -e "^${1} .[ ]*${2} " "${4}" | awk '{ print $3 }')
+
+  not-empty-or-fail "${cmp}" "Failed getting property ${1}.${2} from ${4}"
+
+  if [ $(echo "$cmp >= $ref"|bc) -eq 1 ]; then
+    logmsg "Property greater or equal [${1}.${2}] Actual [${cmp}]"
+  else
+    failure "Error : MediaInfo property mismatch [${1}.${2}] Expected [${ref}] Actual [${cmp}]" 
+  fi
+
+  logpop
+}
+
+
+# Do not forget to use the label MA-MEDIAINFO
+function ma-get ()
+{
+  logpush ma-get
+
+  not-empty-or-fail "${1}" "Usage : ma-get <media> [<group> <property>]"
+
+  mediainfo --full --Output="${2};%${3}%" "${1}" 2>/dev/null
+
+  logpop
+}
+
+function mi-get-s3 ()
+{
+  logpush mi-get-s3
+
+  not-empty-or-fail "${1}" "Usage : mi-get-s3 <media> [<group> <property>]"
+
+  local subfilename=${1:5}
+  local filename=${subfilename#*//}.mi
+
+  logmsg "${subfilename}"
+  logmsg "${filename}"
+  logmsg "analyser -d0 --c=config/mediainfo.conf ${1}"
+  analyser -d0 --c=config/mediainfo.conf "${1}" 2> /dev/null > "${filename}" || rm -f "${filename}"
+
+  have-file-or-fail "${filename}"
+
+  if [ ! -z "${3}" ]
+  then
+
+    grep -e "^${2} .[ ]*${3} " "${filename}" | awk '{ print $3 }'
+
+  fi
+
+  logpop
+}
+
+function mi-get ()
+{
+  logpush mi-get
+
+  not-empty-or-fail "${1}" "Usage : mi-get <media> [<group> <property>]"
+
+  local filename=${1#*//}.mi
+
+  if ! have-file "${filename}"
+  then
+
+    analyser -d0 "${1}" 2> /dev/null > "${filename}" || rm -f "${filename}"
+
+  fi
+
+  have-file-or-fail "${filename}"
+
+  if [ ! -z "${3}" ]
+  then
+
+    grep -e "^${2} .[ ]*${3} " "${filename}" | awk '{ print $3 }'
+
+  fi
+
+  logpop
+}
+
+function mi-get-full ()
+{
+   logpush mi-get-full
+
+   not-empty-or-fail "${1}" "Usage : mi-get-full <media> [<group> <property>]"
+
+   local filename=${1#*//}.mi
+
+   if ! have-file "${filename}"
+   then
+
+     analyser "${1}" 2> "${filename}" > "${filename}" || rm -f "${filename}"
+
+   fi
+
+   have-file-or-fail "${filename}"
+
+   if [ ! -z "${3}" ]
+   then
+
+     grep -e "^${2} .[ ]*${3} " "${filename}" | awk '{ print $3 }'
+
+   fi
+
+   logpop
+}
+
+function blackout-gen-new ()
+{
+  logpush blackout-gen-new
+
+  local interval=${1}
+  local count=${2}
+  local init=${3}
+  local now
+  local end
+
+  [ -z "${interval}" ] && interval=1
+  [ -z "${count}"    ] && count=5040
+  [ -z "${init}"     ] && init=0
+
+  let now=$(date +%s)+${init}*60
+  let end=${interval}*${count}*120+${now}
+
+  echo -e  'c1;1;ref1;"ft"'
+  echo -en "$(date -u "+%Y-%m-%d;%H:%M" -d "@${now}");"
+  echo -e  "$(date -u "+%Y-%m-%d;%H:%M" -d "@${end}")"
+
+  while ((count > 0))
+  do
+
+    let end=${interval}*60+${now}
+
+    echo -en "$(date -u "+%Y-%m-%d;%H:%M" -d "@${now}");"
+    echo -e  "$(date -u "+%Y-%m-%d;%H:%M" -d "@${end}")"
+
+    let now=${interval}*120+${now}
+    let count=${count}-1
+
+  done
+
+  logpop
+}
+
+function hls-segment-check ()
+{
+  logpush hls-segment-check
+
+  not-empty-or-fail "${1}" "Usage : hls-segment-check <path> [max-delta] [max-discont]"
+
+  pud ${1}
+  local max_delta=${2}
+  local max_discont=${3}
+
+  local seg
+  local min
+  local max
+
+  rm -f err
+
+  for rat in $(find -type f -name "*.m3u8" | sort -u)
+  do
+
+    [ -e err ] && break
+
+    # Ignore non rate playlists
+    grep -q '#EXTINF' ${rat} || continue
+
+    printf "\n\n-= $(basename ${rat}) =-\n"
+    printf "%-30s  %10s %10s %10s %10s %10s\n" "Segment" "Playlist" "Start" "Expected" "Error" "Bitrate"
+
+    echo -n > exp
+    echo -n > seq
+
+    local list=$(mktemp)
+    grep -A1 -e "^#EXTINF:" ${rat} |
+    grep -v -e "^--$" |
+    sed -e "s|^#EXTINF:\(.[0-9.]*\).*|\1|g" |
+    xargs -l2 echo > ${list}
+
+    cat ${list} |
+    while read pls seg
+    do
+
+      [ -e err ] && break
+
+      # Skip invalid entries (or variant playlists)
+      [ -z "${pls}" ] && continue
+      [ -z "${seg}" ] && continue
+
+      seq=$(echo "${seg}" | sed -e "s|.*_\(.[0-9]*\)\.ts|\1|g")
+      echo -e ${seq} > ${rat}.seq
+
+      # File path of the current segment
+      local tar=$(dirname ${rat})/${seg}
+
+      # Parse the segment for actual properties
+      tsparse -q -h ${tar} |
+      if read dur tim abr
+      then
+
+        # Initialize expected time
+        exp=$(cat exp)
+        [ -z "${exp}" ] && exp="${tim}"
+
+        # Error between start time and expected value
+        local err=$(echo "scale=4; ${tim}-${exp}" | bc)
+
+        # Remove sign to print absolute value
+        err=${err#-}
+
+        [ "$(echo "${pls} > 0" | bc)" == "1" ] && [ "$(echo "${dur} > 0" | bc)" == "1" ] ||
+        {
+          echo -e "ERROR : Found empty segment : $(readlink -e ${tar})"
+          touch err
+          break
+        }
+
+        [ ! -z "${max_discont}" ] &&
+        {
+          [ "$(echo "${err} > ${max_discont}" | bc)" == "0" ] ||
+          {
+            echo -e "ERROR : Discont (${err}) exeeds limit of ${max_discont} : $(readlink -e ${tar})"
+            touch err
+            break
+          }
+        }
+
+        # Print info
+        printf "%-30s  %10.3f %10.3f %10.3f %10.3f %10.3f\n" "${seq}" "${pls}" "${tim}" "${exp}" "${err}" "${abr}"
+
+        # Next expected time using playlist segment duration
+        exp=$(echo "scale=4; ${exp}+${pls}" | bc)
+        echo -e "${exp}" > exp
+
+      fi
+
+    done
+
+    rm ${list} exp
+
+    [ -e "${rat}.seq" ] || continue
+
+    seq=$(cat ${rat}.seq)
+
+    [ -z "${min}" ] && min=${seq}
+    [ -z "${max}" ] && max=${seq}
+
+    [ "${min}" -gt "${seq}" ] && min=${seq}
+    [ "${max}" -lt "${seq}" ] && max=${seq}
+
+  done
+
+  let delta=${max}-${min}
+  echo -e "\n\nSequence Delta : ${delta}"
+
+  [ ! -z "${max_delta}" ] &&
+  {
+    [ "${delta}" -gt "${max_delta}" ] &&
+    {
+      echo -e "ERROR : Sequence delta (${delta}) exeeds limit of ${max_delta}"
+      touch err
+    }
+  }
+
+  check [ ! -e err ]
+
+  pod
+  logpop
+}
+
+function rmss-pid ()
+{
+  pgrep vanstream
+}
+
+function rmss-alive ()
+{
+  rmss-pid > /dev/null
+}
+
+function rmss ()
+{
+  config/rmss.env "${@}" vanstreamingserver --config-full-path "${WORKDIR}/config/rmss.conf" --policy-file "${WORKDIR}/config/trxlive.conf" --gst-debug-level=2
+}
+
+# Launch the RMSS
+function rmss-start ()
+{
+  logpush rmss-start
+  rmss-alive && failure "RMSS already running with PID : $(rmss-pid)"
+
+  pud "${WORKDIR}"
+  have-file-or-fail "config/ltrx.env" " - Please run ft-setup to configure the environment"
+
+  check mkdir -p medias/sdp
+  check touch medias/sdp
+
+  local count=1
+  local ha=true
+  local fg=false
+  local run=false
+  local ctx
+
+  while [ ! -z "${1}" ]
+  do
+    local opt="${1}"
+    local arg="${2}"
+
+    case "${opt}" in
+      --count)
+        count=${arg}
+        shift;;
+      --gdb)
+        ha=false
+        fg=true
+        ctx="gdb --args";;
+      --valgrind)
+        ctx="${VALGRIND_EXE} ${arg}"
+        shift;;
+      --run)
+        run=true;;
+    esac
+    shift
+  done
+
+  logmsg "Launch rmss"
+
+  if ${fg}
+  then
+    rmss ${ctx}
+    return 1
+  else
+    rmss ${ctx} > config/rmss.log &
+  fi
+
+  for ((n = 1; n < count; ++ n))
+  do
+    rmss ${ctx} > config/rmss-${n}.log &
+  done
+
+  if ${run}
+  then
+
+    logmsg "RMSS running in background ..."
+
+    local loop=true
+    while ${loop}; do
+      read -sn1 -p "Enter 'c' to continue with test, 'd' to dump > " opt
+      echo
+      case "${opt}" in
+        "d" | "D" )
+          rmss-dump;;
+        "c" | "C" )
+          loop=false;;
+      esac
+    done
+
+  fi
+
+  pod
+  logpop
+}
+
+# Stop the RMSS gracefully and trigger a core dump if it appears to be stuck
+function rmss-stop ()
+{
+  logpush rmss-stop
+
+  kill-smooth $(rmss-pid)
+
+  logmsg "Done"
+  logpop
+}
+
+
+
+function help ()
+{
+  if [ -z "${1}" ]
+  then
+    grep -e '^function ' "${WORKDIR}/utilities" | cut -d ' ' -f 2
+  else
+    grep -e '^function ' "${WORKDIR}/utilities" | cut -d ' ' -f 2 | grep -i -e "${@}"
+  fi
+}
+
+function update-exports ()
+{
+  logpush update-exports
+  help | sort -r > .tmp
+
+  for l in $(cat .tmp);
+  do
+
+    if ! grep -q -e "^export -f ${l}" "${WORKDIR}/utilities"
+    then
+
+      logmsg "Export function ${l}"
+      check sed -e "s|^#%EXPORTS%|#%EXPORTS%\nexport -f ${l}|" -i "$(readlink -e ${WORKDIR}/utilities)"
+
+    fi
+
+  done
+
+  logpop
+}
+
+function tc-shaping ()
+{
+
+  if ((UID))
+  then
+    echo -e "Must be root..." 1>&2
+    return 1
+  fi
+
+  if [ -z "${3}" ]
+  then
+    echo -e "Usage : ${0} <device> <port> <rate>"
+  fi
+
+  which tc &&
+  which iptables ||
+  return 1
+
+  # Cleanup
+  iptables -D OUTPUT -t mangle -p tcp --sport ${2} -j MARK --set-mark ${2}
+  tc qdisc del dev ${1} root
+
+  # Turn on queuing discipline
+  tc qdisc add dev ${1} root handle 1:0 htb &&
+
+  # Define a class with limitation
+  tc class add dev ${1} parent 1:0 classid 1:1 htb rate ${3} &&
+
+  # Match the mangling to the rule
+  tc filter add dev ${1} parent 1:0 prio 1 protocol ip handle ${2} fw flowid 1:1 &&
+
+  # Use iptables mangle rule to filter port
+  iptables -A OUTPUT -t mangle -p tcp --sport ${2} -j MARK --set-mark ${2} &&
+
+  true
+
+  loop=true
+  while ${loop}; do
+
+    # Dump current state
+    tc qdisc show dev ${1}
+    tc class show dev ${1}
+    tc filter show dev ${1}
+    iptables -L OUTPUT
+
+    read -sn1 -p "Running, q to quit > " opt
+    echo
+    case "${opt}" in
+      "q" | "Q" )
+        loop=false;;
+    esac
+  done
+
+  # Cleanup
+  iptables -D OUTPUT -t mangle -p tcp --sport ${2} -j MARK --set-mark ${2}
+  tc qdisc del dev ${1} root
+
+}
+
+function put-server-pid ()
+{
+  pgrep -f put_server.py
+}
+
+function put-server-alive ()
+{
+  put-server-pid > /dev/null
+}
+
+function put-server-stop ()
+{
+  logpush put-server-stop
+  logmsg "Kill Python put server"
+  kill-smooth $(put-server-pid)
+  logmsg "Python put server killed"
+  logpop
+}
+
+function put-server-start ()
+{
+  logpush put-server-start
+  if have-file "put_server.py"
+  then
+    logmsg "Starting Python put server"
+    # stop the current server if it's alive
+    put-server-alive && put-server-stop
+
+    ./put_server.py &
+    logmsg "Python put server started at $!"
+  else
+    failure "Please link put_server.py from scripts"
+  fi
+  logpop
+}
+
+# BWO-10126: common methods to execute functional tests for execution
+# and validation of HLS/HEVC (could apply to other HLS as well
+
+function validate_mp4_headers ()
+{
+   mediainfo --Details=1 -f "${1}" > "${1}".mi2
+   offset_tfdt=`grep -m 1 -b "tfdt" "${1}".mi2 | awk 'BEGIN{FS=":"}{print $1}'`
+   offset_trun=`grep -m 1 -b "trun" "${1}".mi2 | awk 'BEGIN{FS=":"}{print $1}'`
+   
+   ft-check test $offset_trun -gt $offset_tfdt
+}
+
+function validate_playlist ()
+{
+   if [ "${2}" == "video" ]; then
+      
+      count_occurence=`grep -E "\#EXT-X-STREAM-INF\:.*RESOLUTION=1440x1088" "${1}" | grep -E "BANDWIDTH=" -c`
+      logmsg "Found $count_occurence occurence of video in ${1}"
+      ft-check test ${count_occurence} -eq ${3}  
+
+      # video codec presence validation
+      count_occurence=`grep "CODECS=\"hvc1" "${1}" -c`
+      logmsg "Found $count_occurence occurence of \"CODECS=\"hvc1\" in ${1}"
+      if [ "${4}" == "no-codec" ]; then
+         ft-check test ${count_occurence} -eq 0
+      else
+         ft-check test ${count_occurence} -eq ${3}         
+      fi
+          
+   elif [ "${2}" == "audio" ]; then
+      # audio presence validation
+      count_occurence=`grep "\#EXT-X-MEDIA:URI=.*TYPE=AUDIO,GROUP-ID=\"full\",LANGUAGE=\"und\",NAME=\"Eng Audio\",DEFAULT=YES,AUTOSELECT=YES" "${1}" -c`
+      logmsg "Found $count_occurence occurence of audio in ${1}"
+      ft-check test ${count_occurence} -eq ${3} 
+   fi
+}
+
+function validate_ms_basic ()
+{
+   # check output
+   ft-check wait-for-file "medias/output/default.m3u8" "30"
+   ft-check file-larger-than "medias/output/default.m3u8" ${1}
+   ft-check file-larger-than "medias/output/default/ft-HLS-default.m3u8" ${2}
+   ft-check file-larger-than "medias/output/default/ft-default_0.mp4" ${3}
+   ft-check file-larger-than "medias/output/default/ft-default_1.mp4" ${4}
+   if [ ! -z ${5} ]; then
+      ft-check file-larger-than "medias/output/default/ft-default_2.mp4" ${5}
+   fi
+   
+   # Get informations on files
+   mi-get-full "medias/output/default/ft-default_0.mp4"
+   
+   # Grep for useful info
+   ft_default_0_count_video=`grep medias/output/default/ft-default_0.mp4.mi -e video/h265 -c`
+   
+   # Validate a correct output
+   logmsg "Found $ft_default_0_count_video occurence of \"video/h265\" in ft-default_0.mp4"
+   ft-check test $ft_default_0_count_video -eq 1
+   
+   # validate other segments
+   ft-check grep moof medias/output/default/ft-default_1.mp4
+   if [ ! -z ${5} ]; then
+      ft-check grep moof medias/output/default/ft-default_2.mp4
+   fi
+   
+   validate_mp4_headers medias/output/default/ft-default_0.mp4
+}
+
+function validate_ss_basic ()
+{
+   # check output
+   ft-check wait-for-file "medias/output/default.m3u8" "30"
+   ft-check file-larger-than "medias/output/default.m3u8" ${4}
+   ft-check file-larger-than "medias/output/${2}/ft-HLS-${2}.m3u8" ${5}
+   ft-check file-larger-than "medias/output/${2}/"${1}".mp4" ${6}
+   
+   # Get informations on files
+   mi-get-full "medias/output/${2}/"${1}".mp4"
+   
+   # Grep for useful info
+   count_video=`grep medias/output/${2}/"${1}".mp4.mi -e ${3} -c`
+   
+   # Validate a correct output
+   logmsg "Found $count_video occurence of \"${3}\" in "${1}".mp4"
+   ft-check test $count_video -eq 1
+   
+   # validate other segments
+   ft-check grep moof medias/output/${2}/"${1}".mp4
+   
+   validate_mp4_headers medias/output/${2}/"${1}".mp4
+}
+
+function run_test ()
+{
+   TEST_ID="${1}"
+   VALIDATE="${2}"
+   VALIDATE_ARGUMENTS="${3}"
+   
+   echo "Running test ${TEST_ID}..."
+   
+   rm -rf medias/output medias/Megan_Fox_FHM.mp4
+   
+   medias=(${medias[@]} http://meduse.sherb.vantrix.com/meduse_medias/Megan_Fox_FHM.mp4)
+   
+   # Basic Setup
+   source "$(dirname ${0})/utilities"
+   
+   # Use the test prologue for sanity checks
+   ft-prologue "${@}"
+   
+   # Initialize test, launch the LTRX and begin processing
+   ft-setup "${@}"
+   
+   ${VALIDATE} "${VALIDATE_ARGUMENTS}"
+   
+   logmsg "SUB-TEST ${TEST_ID} GOOD!"
+   
+   # Checks are complete, terminate the test and cleanup
+   ft-teardown
+}
+
+function ts-parse ()
+{
+  config/ltrx.env tsparse "${@}"
+}
+
+function rtsp-simple-server-start ()
+{
+   # 1st arg: log file to create
+   # 2nd arg: optional configuration file path & name
+
+   rtsp-simple-server-stop
+
+   logpush rtsp-simple-server-start
+
+   RTSP_SIMPLE_SERVER='rtsp-simple-server'
+
+   # verify server's existence
+   ft-check test `command -v ${RTSP_SIMPLE_SERVER}`
+
+   # run server in background
+   ${RTSP_SIMPLE_SERVER} ${2} >> ${1} 2>&1 &
+}
+
+function rtsp-simple-server-stop ()
+{
+   logpush "rtsp-simple-server-stop"
+   
+   PID=${1}
+   if [ -z "${PID}" ]; then
+      PID=`ps -eaf | grep rtsp-simple-server | grep -v "color=auto" | awk '{print $2}'`
+   fi
+
+   if [ ! -z "${PID}" ]; then
+      kill-smooth ${PID} &> /dev/null
+   fi
+}
+
+{
+
+# Execution code - Allows running the utilities directly
+[ "$(basename "${0}")" == "utilities" ] && "${@}"
+
+}
