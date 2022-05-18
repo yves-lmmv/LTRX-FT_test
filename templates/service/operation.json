@@ -1,0 +1,9 @@
+{
+    "_id": "clockRed",
+    "name": "clockRed",
+    "timestamp": timestamp,
+    "type": "clockOverlay",
+    "red": "255",
+    "green": "40",
+    "blue": "20"
+}

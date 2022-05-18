@@ -1,0 +1,25 @@
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "audio": [
+    {
+      "trackId": "98",
+      "codec": "audio/aac",
+      "bitrate": "64000"
+    }
+  ],
+  "video": [
+    {
+      "trackId": "96",
+      "codec": "video/h264",
+      "bitrate": "1500000",
+      "framerate": "30/1",
+      "handler": "software",
+      "transcode": "false",
+      "kfs": "2000",
+      "width": 320,
+       "height": 240,
+    }
+  ]
+}

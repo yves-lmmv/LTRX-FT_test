@@ -1,0 +1,27 @@
+{
+  "_id": name,
+  "name": name,
+    "type": "hls",
+    "url": "file://output",
+    "segmentDuration": "5000",
+    "rate": [
+        {
+            "name": "rate-1",
+            "trackId": [
+                "96"
+            ]
+        }
+    ],
+    "variant": [
+        {
+            "name": "iPhone",
+            "rate": [
+                "rate-1"
+            ]
+        }
+    ],
+  "mediaProfile": {
+    "\$ref": "profiles",
+    "\$id": name,
+  }
+}

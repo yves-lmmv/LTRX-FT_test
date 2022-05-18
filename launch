@@ -1,0 +1,8 @@
+#!/bin/bash
+
+for ft in $(find cases/ -maxdepth 1 -mindepth 1 -type d | sort)
+do
+
+  "${ft}/run" "${@}"
+
+done

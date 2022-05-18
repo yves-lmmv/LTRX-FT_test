@@ -1,0 +1,17 @@
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "group": "default",
+  "type": "default",
+  "scope": "live",
+  "control": "enabled",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name,
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name,
+  }
+}

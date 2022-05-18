@@ -1,0 +1,20 @@
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "program": null,
+  "type": "file",
+  "url": "udp://232.88.0.112:1236",
+  "audio": [
+    {
+      "pid": null,
+      "preferredLanguage": null
+    }
+  ],
+  "video": [
+    {
+      "pid": null,
+      "handler": null
+    }
+  ]
+}
