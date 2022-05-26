@@ -1,0 +1,60 @@
+#!/bin/bash
+
+cat << EOF
+LTRX-200 : HA Sentinel Removes LTRX Token After Crash/Restart
+
+Created 6/30/2021
+Given an existing service that crashed/timed out, the LTRX can delete the expired service and start his new job.
+The HA Sentinel is reponsible to find and delete the old LTRX service token registration in the database and delete it.
+
+Related bugs: 
+- https://lmmv.atlassian.net/browse/LTRX-200
+- https://lmmv.atlassian.net/browse/LTRX-98
+
+
+EOF
+
+#Add any required label, jenkins will assigned a node corresponding to that label string giving.
+#Jenkins will still enforce all test to run on a node that can run test (FT-LTRX labelled node)
+#No matter what is written in labels
+#If no node can be run the test (no node with the corresponding label) the test will be desactivated.
+#Jenkins allows label expression 
+#ex:
+#  (LABEL1&&LABEL2)||(LABEL1&&LABEL3)
+#
+#You should add labels to a test if said test requires some optional package or specific hardware.
+#here are some labels : OPT-MSS,OPT-IDCC,OPT-Immervison
+#instead of ussing GPU has a label for test using IMS, use OPT-MSS
+##LABEL:
+
+# if you need some media uncomment this :
+#Be carefull to keep the medias requested are following the exact format below. Don't removed the array expand and export has a last line.
+# medias=(${medias[@]} http://meduse.sherb.vantrix.com/meduse_medias/fast.mp4)
+# export medias
+
+rm medias/output -rf
+export GST_DEBUG='*:3'
+
+# Basic Setup
+source "$(dirname ${0})/utilities"
+
+rm medias/output -rf
+
+# Use the test prologue for sanity checks
+ft-prologue "${@}"
+
+# Initialize Test
+ft-setup "${@}"
+
+logmsg "Make sure the video output was produced"
+ft-check wait-for-file "medias/output/video-out.mp4" "45"
+
+logmsg "Make sure that the old ltrx service was removed"
+LTRX_TOKEN_REMOVED_REGEX_RESULT=`grep "ServicesDispatcher.DbManager - Handling message type EraseReservation..." config/ltrx.log | wc -l`
+
+ft-check test $LTRX_TOKEN_REMOVED_REGEX_RESULT -eq 1
+
+logmsg "TEST GOOD!"
+
+# Checks are complete, terminate the test and cleanup
+ft-teardown

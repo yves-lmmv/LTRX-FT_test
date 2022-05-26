@@ -1,0 +1,131 @@
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+var timestamp = "$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+
+var profile = [
+{
+    "_id" : name,
+    "name" : name,
+    "timestamp" : timestamp,
+    "video" : [ 
+        {
+            "trackId" : "31",
+            "codec" : "video/h264",
+            "bitrate" : "10000000",
+            "width" : "320",
+            "height" : "480",
+            "kfs" : "2000",
+            "framerate" : "15",
+            "scalingMethod" : "pan",
+            "encoderParams" : "profile=high"
+        }
+    ]
+}
+,
+];
+
+db.profiles.insert (profile);
+
+
+var target = [
+{
+  "_id": name,
+  "name": name,
+  "type" : "file",
+    "mime" : "video/mp4",
+    "url" : "file://output/video-out.mp4",
+    "timestamp" : timestamp,
+    "mediaProfile" : {
+        "\$ref" : "profiles",
+        "\$id" : name
+    }
+}
+,
+];
+
+db.targets.insert (target);
+
+
+var source = [
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "type": "video",
+  "numBuffers": "300",
+  "video": [
+    {
+      "width" : "160",
+      "height" : "120",
+      "framerate": "15/1"
+    }
+  ],
+  "pattern" : "0"
+}
+,
+];
+
+db.sources.insert (source);
+
+
+var ltrx_field = {
+    "cluster_id": "multicam",
+    "group_id": "ltv",
+    "instance_id": "LTRX_5379",
+    "keepalive_timestamp": "2021-06-28T21:11:17.195+0000",
+    "node_id": "centos-74-devel",
+    "start_time": "2021-06-28T21:10:46.211+0000",
+    "cpu_weight_pxps": "183638016",
+    "gpu_weight_pxps": "0",
+    "status": "running",
+    "status_code": "0"
+};
+
+var result_field = {
+    "executor": "multicam.centos-74-devel.LTRX_5379",
+    "start_time": "2021-06-28T21:10:46.211+0000",
+    "status_code": "-1",
+    "status_description": "Building service failed: Timeout detected by executor",
+    "status_detail": "-1",
+    "playable_targets": [],
+    "cpu_weight_pxps": "183638016",
+    "gpu_weight_pxps": "0",
+    "last_error": "Building service failed: Timeout detected by executor",
+    "last_error_executor": "multicam.centos-74-devel.LTRX_5379",
+    "last_error_time": "2021-06-28T21:11:17.286+0000"
+};
+
+var service = [
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "type": "multirate",
+  "control": "enabled",
+  "priority": "1",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name,
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name,
+  },
+  "ltrx": ltrx_field,
+  "result": result_field
+}
+,
+];
+
+db.services.insert (service);
+
+EOS
+
+: ${MONGODB_URL:="ltrx"}
+#mongo ${MONGODB_URL} config/mongo-populate.js
