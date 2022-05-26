@@ -10,7 +10,7 @@
 : ${TRACE:="false"}
 : ${FAIL_ACTION:="exit"}
 : ${RET_VALUE:="0"}
-: ${GLOBAL_MEDIA_PATH:="/srv/meduse"}
+: ${GLOBAL_MEDIA_PATH:="/jenkins_shared/"}
 # test that use authentication must set the "-u user -p pass" string that correspond to the db user password of that test
 : ${MONGODUMP_USER_PASS:=""}
 

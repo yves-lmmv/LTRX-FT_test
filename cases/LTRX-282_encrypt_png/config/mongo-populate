@@ -1,0 +1,155 @@
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+
+var timestamp = "$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+var target = [
+{
+   "_id": name,
+   "name": name,
+   "type": "image",
+   "url": "file://output/100.png.encrypted",
+   "timestamp": timestamp,
+   "mediaProfile":
+    {
+        "_id": "asp_jpeg_1080p",
+        "name": "asp_jpeg_1080p",
+        "video": [
+          {
+              "trackId" : "31",
+              "codec" : "image/png",
+              "width" : "100",
+              "height" : "100"
+          }
+        ],
+        "timestamp": timestamp
+    },
+    "drm" : 
+    {
+        "type" : "oracle",
+        "oracle" : 
+        {
+            "tenancy_id" : "ocid1.tenancy.oc1..aaaaaaaatzlccjqy5awi2nyminxaecy4is2glvhd54gxq4tonsgspzolo7za",
+            "user_id" : "ocid1.user.oc1..aaaaaaaahmmhmo6whlsdlou5lsijaukhfe5lr64vkbjvnul4esnfhzd2lo3a",
+            "master_key_id" : "ocid1.key.oc1.ca-montreal-1.dvq56alqaahfw.ab4xkljrercqfvro44t45dti5pigidxb3433fiyhnrxzajp23qlkd6v5uq6q",
+            "crypto_endpoint" : "dvq56alqaahfw-crypto.kms.ca-montreal-1.oraclecloud.com",
+            "cipher_encryption_key" : "QS45CE/czQVcAEHm66374MiKMz9uzrZ6AI0gzkYjTqNACxUevLtJoaeV8vsWehaLsJwWEDcjAAAAAA==",
+            "NOTE" : "By Providing the encryption_key, the code won't try to get it from Oracle. This is for debug purpose",
+            "encryption_iv" : "3AB467FED1987A4123AB467FED1987A4",
+            "encryption_key" : "000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F",
+            "cypher" : "aes-256-cbc",
+            "api_pem_key" : "-----BEGIN PRIVATE KEY-----\n THIS IS NOT A REAL API KEY \n-----END PRIVATE KEY-----"
+        }
+    },
+},
+{
+   "_id": name + "_bad",
+   "name": name + "_bad",
+   "type": "image",
+   "url": "file://output/100.png.encrypted_bad",
+   "timestamp": timestamp,
+   "mediaProfile":
+    {
+        "_id": "asp_jpeg_1080p",
+        "name": "asp_jpeg_1080p",
+        "video": [
+          {
+              "trackId" : "31",
+              "codec" : "image/png",
+              "width" : "100",
+              "height" : "100"
+          }
+        ],
+        "timestamp": timestamp
+    },
+    "drm" : 
+    {
+        "cypher" : "sample-aes",
+        "type" : "oracle",
+        "oracle" : 
+        {
+            "tenancy_id" : "ocid1.tenancy.oc1..aaaaaaaatzlccjqy5awi2nyminxaecy4is2glvhd54gxq4tonsgspzolo7za",
+            "user_id" : "ocid1.user.oc1..aaaaaaaahmmhmo6whlsdlou5lsijaukhfe5lr64vkbjvnul4esnfhzd2lo3a",
+            "master_key_id" : "ocid1.key.oc1.ca-montreal-1.dvq56alqaahfw.ab4xkljrercqfvro44t45dti5pigidxb3433fiyhnrxzajp23qlkd6v5uq6q",
+            "crypto_endpoint" : "dvq56alqaahfw-crypto.kms.ca-montreal-1.oraclecloud.com",
+            "cipher_encryption_key" : "QS45CE/czQVcAEHm66374MiKMz9uzrZ6AI0gzkYjTqNACxUevLtJoaeV8vsWehaLsJwWEDcjAAAAAA==",
+            "NOTE" : "By Providing the encryption_key, the code won't try to get it from Oracle. This is for debug purpose",
+            "encryption_iv" : "3AB467FED1987A4123AB467FED1987A4",
+            "encryption_key" : "000102030405060708090A0B0C0D0E0F",
+            "NOTE1" : "",
+            "NOTE2" : "",
+            "NOTE3" : "BAD CYPHER!!!!!!!!!!!!",
+            "cypher" : "aes-128-cbc_BAD_CYPHER_VALUE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+            "api_pem_key" : "-----BEGIN PRIVATE KEY-----\n THIS IS NOT A REAL API KEY \n-----END PRIVATE KEY-----"
+        }
+    },
+}
+];
+
+db.targets.insert (target);
+
+
+var source = [
+    {
+       "_id" : name,
+       "name" : name,
+       "timestamp" : timestamp,
+       "type" : "file",
+       "url" : "file://apple-green.png"
+    }
+];
+
+db.sources.insert (source);
+
+
+var service = [
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "group": "default",
+  "type": "default",
+  "scope": "offline",
+  "control": "enabled",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name,
+  }
+}
+,
+{
+  "_id": name + "_bad",
+  "name": name + "_bad",
+  "timestamp": timestamp,
+  "group": "default",
+  "type": "default",
+  "scope": "offline",
+  "control": "disabled",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name + "_bad",
+  }
+}
+,
+];
+
+db.services.insert (service);
+
+
+EOS
+
+: ${MONGODB_URL:="ltrx"}
+#mongo ${MONGODB_URL} config/mongo-populate.js

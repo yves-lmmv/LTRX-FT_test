@@ -1,0 +1,86 @@
+#!/bin/bash
+
+cat << EOF
+LTRX-282 : Oracle OCI Vault Image Decrypt/Encrypt Support
+
+Encrypt a png with LTRX with aes-256-cbc
+First step is just to test encrypt using a key provide direclty in target.
+
+ie : This test didn't need to connect to an Oracle server to decrypt the encryption key.
+
+EOF
+
+
+#Add any required label, jenkins will assigned a node corresponding to that label string giving.
+#Jenkins will still enforce all test to run on a node that can run test (FT-LTRX labelled node)
+#No matter what is written in labels
+#If no node can be run the test (no node with the corresponding label) the test will be desactivated.
+#Jenkins allows label expression 
+#ex:
+#  (LABEL1&&LABEL2)||(LABEL1&&LABEL3)
+#
+#You should add labels to a test if said test requires some optional package or specific hardware.
+#here are some labels : OPT-MSS,OPT-IDCC,OPT-Immervison
+#instead of ussing GPU has a label for test using IMS, use OPT-MSS
+##LABEL:
+
+# if you need some media uncomment this :
+#Be carefull to keep the medias requested are following the exact format below. Don't removed the array expand and export has a last line.
+medias=(${medias[@]} http://meduse.sherb.vantrix.com/meduse_medias/apple-green.png)
+export medias
+#
+# if you produce output, clean them before test start
+rm medias/output -rf
+#
+# vod output need to have the output path created
+#mkdir -p medias/output/rate-1
+
+# Basic Setup
+source "$(dirname ${0})/utilities"
+
+# Use the test prologue for sanity checks
+ft-prologue "${@}"
+
+# Initialize test, launch the LTRX and begin processing
+ft-setup "${@}"
+
+logmsg "======================================"
+logmsg "Validate that service with drm entry and debug encryption key"
+logmsg "work correctly."
+
+# check output
+ft-check wait-for-file "medias/output/100.png.encrypted" "10"
+
+logmsg "Now decrypting medias/output/100.png.encrypted"
+# We use the same encryption key than in the service (and same iv vector)
+openssl enc -d -aes-256-cbc -in medias/output/100.png.encrypted -out medias/output/100.png -K 000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F -iv 3AB467FED1987A4123AB467FED1987A4
+
+ft-check wait-for-file "medias/output/100.png" "1"
+
+logmsg "basic analysis of the decrypted file"
+analyser "medias/output/100.png" &> "medias/output/analysis.txt"
+
+logmsg "check if file type is PNG"
+ft-check grep --quiet "ContentType image/png" "medias/output/analysis.txt"
+
+logmsg "Success"
+
+logmsg "======================================"
+logmsg "Validate that service with drm entry that is wrongly constructed"
+logmsg "did NOT generate any output."
+
+logmsg "Enabling bad service now"
+ft-check mongo-service-specific-control ft_bad enabled
+
+logmsg "Waiting 8 seconds. There should be no output generated : medias/output/100.png.encrypted_bad"
+ft-must-fail wait-for-file "medias/output/100.png.encrypted_bad" "10"
+
+logmsg "OK, no file generated. Check the LTRX log to confirm there is an error to encrypt"
+TOTO=`grep "ERROR" config/ltrx.log | grep  "FilePublisher2 Fail to encrypt"`
+ft-check grep "FilePublisher Fail to encrypt" config/ltrx.log
+
+
+logmsg "TEST GOOD!"
+
+# Checks are complete, terminate the test and cleanup
+ft-teardown
