@@ -1,0 +1,127 @@
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+var timestamp = "$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+var profile = [
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+      "audio" : [ 
+        {
+            "codec" : "audio/aac",
+            "bitrate" : "128000",
+            "channelMode" : "stereo",
+            "samplingRate" : "48000",
+            "pid" : "23",
+            "trackId" : "23",
+            "encoderParams" : "max-size-buffers=1 max-size-time=40000000 max-size-bytes=0"
+        }
+    ],
+    "video" : [ 
+        {
+            "codec" : "video/h264",
+            "bitrate" : "3000000",
+            "trackId" : "21",
+            "pid" : "21",
+            "width" : "1920",
+            "height" : "1080",
+            "kfs" : "2000",
+            "framerate" : "24000/1001",
+            "scalingMethod" : "preserve",
+            "encoderParams" : "bframes=2 scaling-algo=5 keyint-mode=frame keyint-abs=100 max-size-buffers=1 max-size-time=40000000 max-size-bytes=0",
+            "handler" : "software",
+            "transcode" : "false",
+            "operation" : []
+        }
+    ],
+
+}
+,
+];
+
+db.profiles.insert (profile);
+
+
+var target = [
+{
+  "_id": name,
+  "name": name,
+    "type" : "file",
+    "mime" : "video/mpegts",
+    "url" : "file://output/output2.ts",
+    "advancedParams" : "protocol=tcp max-size-buffers=0 max-size-time=3000000000 max-size-bytes=0",
+   "timestamp": timestamp,
+    "mediaProfile" : {
+        "\$ref" : "profiles",
+      "\$id": name,
+    }
+}
+];
+
+db.targets.insert (target);
+
+
+var source = [
+{
+   "_id": "LTRX_360_duration_ts",
+   "name": "LTRX_360_duration_ts",
+   "type": "browser",
+   "url": "https://www.youtube.com/watch?v=yPYZpwSpKmA",
+   "audio" : [ 
+      {
+          "index" : "24"
+      }
+  ],
+  "video" : [ 
+      {
+          "index" : "22",
+          "decoderParams" : "max-size-buffers=1 max-size-time=40000000 max-size-bytes=0",
+          "operation" : []
+      }
+  ],
+  "advancedParams" : "max-size-bytes=0 max-size-buffers=0 max-size-time=3000000000",
+   "timestamp": timestamp
+}
+,
+];
+
+db.sources.insert (source);
+
+
+var service = [
+{
+   "_id": "LTRX_360_duration_ts",
+   "name": "LTRX_360_duration_ts",
+   "control": "enabled",
+   "scope": "live",
+   "type": "multirate",
+   "timestamp": timestamp,
+   "sourceMediaDefinition": [
+      {
+         "\$ref": "sources",
+         "\$id": "LTRX_360_duration_ts"
+      }
+   ],
+   "targetMediaDefinition": [
+      {
+         "\$ref": "targets",
+         "\$id": name
+      }
+   ]
+}
+,
+];
+
+db.services.insert (service);
+
+
+EOS
+
+: ${MONGODB_URL:="ltrx"}
+#mongo ${MONGODB_URL} config/mongo-populate.js

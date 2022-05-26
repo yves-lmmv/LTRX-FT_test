@@ -1,0 +1,69 @@
+<html>
+<head>
+<title>LTRX-FT SDP Publisher</title>
+<script language="javascript" src="sdplist.js"></script>
+<script language="javascript">
+
+function loadServices ()
+{
+   var container = document.getElementById('services');
+
+   for (var i = 0; i < SdpList.length; ++i)
+   {
+      var n = SdpList[i];
+      var e = document.createElement('li');
+      var s = "";
+
+      s += "<a href='";
+      s += n;
+      s += "'>";
+      s += n;
+      s += "</a><br>"
+
+      e.innerHTML = s;
+      container.appendChild (e);
+   }
+}
+
+</script>
+
+<style>
+body
+{
+  font-family: sans-serif;
+  background-color: #222;
+  color: #FF6600;
+}
+
+a
+{
+  color: #FF6600;
+  cursor: hand;
+  font-weight: bold;
+  text-decoration: none;
+  text-shadow:
+    rgba(0, 0, 0, 0.5) 1px 1px 1px;
+}
+
+a:hover
+{
+  text-shadow:
+   -1px  0px 0.5px rgba(101, 255, 1, 0.4),
+    1px  0px 0.5px rgba(101, 255, 1, 0.4),
+    0px -1px 0.5px rgba(101, 255, 1, 0.4),
+    0px  1px 0.5px rgba(101, 255, 1, 0.4);
+}
+</style>
+
+</head>
+<body>
+   <div class="header">
+      <a href="/">
+         <h1>SDP</h1>
+         LTRX-FT SDP Publisher<br><br>
+      </a>
+   </div>
+   <div><ul id='services'></ul></div>
+   <script> loadServices(); </script>
+</body>
+</html>

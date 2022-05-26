@@ -1,0 +1,90 @@
+#!/bin/bash
+
+cat << EOF
+LTRX-360_duration_ts : Browser source TS. 
+
+This test check that LTRX Engine generate duration and size in the service/ltrx mongo document each seconds
+
+EOF
+
+
+function ft-check-bigger()
+{
+   if [ -z $1 ]
+     then
+       return 0
+   fi
+
+   if [ -z $2 ]
+     then
+       return 0
+   fi
+
+   return `echo $1'>'$2 | bc -l`
+}
+
+function ft-check-different()
+{
+  if [ "$1" != "$2" ] 
+    then 
+      return 0
+  else
+    return 1
+  fi
+}
+
+rm medias/output -rf
+
+
+export GST_DEBUG="cefdemux:2,cefsrc:2"
+
+# Basic Setup
+source "$(dirname ${0})/utilities"
+
+# Use the test prologue for sanity checks
+ft-prologue "${@}"
+
+# Initialize test, launch the LTRX and begin processing
+ft-setup "${@}"
+
+ft-check wait-for-file "medias/output/output2.ts"  "15"  "false"
+
+sleep 4
+
+# check that we have duration and size report in the service/ltrx document
+
+first_size=$(mongo-get services.LTRX_360_duration_ts.ltrx.size)
+logmsg "Checking first size"
+ft-check [ ! -z $first_size ]
+
+first_duration=$(mongo-get services.LTRX_360_duration_ts.ltrx.duration)
+logmsg "Checking first duration"
+ft-check [ ! -z $first_duration ]
+
+
+sleep 4
+
+# duration and size should have changed 
+
+second_size=$(mongo-get services.LTRX_360_duration_ts.ltrx.size)
+logmsg "Checking second size"
+ft-check [ ! -z $second_size ]
+
+second_duration=$(mongo-get services.LTRX_360_duration_ts.ltrx.duration)
+logmsg "Checking second duration"
+ft-check [ ! -z $second_duration ]
+
+
+logmsg "check that the second size is bigger. size $first_size and $second_size"
+ft-check ft-check-bigger $first_size $second_size
+
+
+logmsg "check that the first and second duration are different:  $first_duration and $second_duration"
+ft-check ft-check-different $first_size $second_size
+
+# Checks are complete, terminate the test and cleanup
+
+logmsg "TEST GOOD!"
+
+# Checks are complete, terminate the test and cleanup
+ft-teardown

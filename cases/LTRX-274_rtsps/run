@@ -1,0 +1,79 @@
+#!/bin/bash
+
+cat << EOF
+LTRX-274: functional test that validates generation of rtsps output from LTRX to rtsp-simple-server
+with self generated certificate
+
+EOF
+
+
+#Add any required label, jenkins will assigned a node corresponding to that label string giving.
+#Jenkins will still enforce all test to run on a node that can run test (FT-LTRX labelled node)
+#No matter what is written in labels
+#If no node can be run the test (no node with the corresponding label) the test will be desactivated.
+#Jenkins allows label expression 
+#ex:
+#  (LABEL1&&LABEL2)||(LABEL1&&LABEL3)
+#
+#You should add labels to a test if said test requires some optional package or specific hardware.
+#here are some labels : OPT-MSS,OPT-IDCC,OPT-Immervison
+#instead of ussing GPU has a label for test using IMS, use OPT-MSS
+##LABEL:
+
+# if you need some media uncomment this :
+#Be carefull to keep the medias requested are following the exact format below. Don't removed the array expand and export has a last line.
+medias=(${medias[@]} http://meduse.sherb.vantrix.com/meduse_medias/Avril_Lavigne_-_What_The_Hell_1920x1080.mp4)
+export medias
+#
+# if you produce output, clean them before test start
+rm medias/output -rf
+#
+# vod output need to have the output path created
+#mkdir -p medias/output/rate-1
+
+# Basic Setup
+source "$(dirname ${0})/utilities"
+
+
+#
+# The server.key and cert was done with 
+# openssl genrsa -out server.key 2048
+# openssl req -new -x509 -sha256 -key server.key -out server.crt -days 3650
+#
+# if you want to do normal rtsp (no tls encryption). remove the "_cert" from the command below.
+# and change the mongo-populate target to "url": "rtsp://127.0.0.1:8554/mystream"
+#
+
+rm -f config/rtsp-simple-server.log
+rtsp-simple-server-start config/rtsp-simple-server.log config/rtsp-simple-server_cert.yml
+RTSP_SIMPLE_SERVER_PID=$!
+
+logmsg "RTSP_SIMPLE_SERVER_PID: ${RTSP_SIMPLE_SERVER_PID}"
+
+# Use the test prologue for sanity checks
+ft-prologue "${@}"
+
+# Initialize test, launch the LTRX and begin processing
+ft-setup "${@}"
+
+logmsg "Let LTRX stream toward rtsp-simple-server in rtsps for 15s."
+logmsg "You can test the rtsps stream by doing ffplay -i rtsps://127.0.0.1:8555/mystream"
+wait-for-time 15
+
+rtsp-simple-server-stop ${RTSP_SIMPLE_SERVER_PID}
+
+# validate rtsp-simple-server did share the stream from ltrx rtsp output
+RTSP_SIMPLE_SERVER_STREAM=`grep "is publishing to path 'mystream', 2 tracks with tcp" config/rtsp-simple-server.log | wc -l`
+ft-check test $RTSP_SIMPLE_SERVER_STREAM -eq 1
+
+AUDIO_CODEC_TEST=`grep "a=rtpmap:96 MP4A-LATM/48000" config/rtsp-simple-server.log | wc -l`
+ft-check test $AUDIO_CODEC_TEST -ge 1
+
+# search for a number in rtpmap:NUMBER that is valid: between 96 and 127
+VIDEO_CODEC_TEST=`grep "a=rtpmap:\(\(9[6-9]\)\|\(1[0-1][0-9]\)\|\(12[0-7]\)\) H264/90000" config/rtsp-simple-server.log | wc -l`
+ft-check test $VIDEO_CODEC_TEST -ge 1
+
+logmsg "TEST GOOD!"
+
+# Checks are complete, terminate the test and cleanup
+ft-teardown

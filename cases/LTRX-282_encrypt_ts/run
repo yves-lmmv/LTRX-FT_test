@@ -1,0 +1,60 @@
+#!/bin/bash
+
+cat << EOF
+LTRX-282_encrypt_ts : mpegts aes-256-cbc encryption test with vanrawcrypto filter
+
+
+
+EOF
+
+#Add any required label, jenkins will assigned a node corresponding to that label string giving.
+#Jenkins will still enforce all test to run on a node that can run test (FT-LTRX labelled node)
+#No matter what is written in labels
+#If no node can be run the test (no node with the corresponding label) the test will be desactivated.
+#Jenkins allows label expression 
+#ex:
+#  (LABEL1&&LABEL2)||(LABEL1&&LABEL3)
+#
+#You should add labels to a test if said test requires some optional package or specific hardware.
+#here are some labels : OPT-MSS,OPT-IDCC,OPT-Immervison
+#instead of ussing GPU has a label for test using IMS, use OPT-MSS
+##LABEL:
+
+# if you need some media uncomment this :
+#Be carefull to keep the medias requested are following the exact format below. Don't removed the array expand and export has a last line.
+medias=(${medias[@]} http://meduse.sherb.vantrix.com/meduse_medias/VIDEO/PIXEL/mp4/h264/Mormons_ads.mp4)
+export medias
+#
+# if you produce output, clean them before test start
+rm medias/output -rf
+#
+KEY="000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F"
+IV="000102030405060708090A0B0C0D0E0F"
+
+# Basic Setup
+source "$(dirname ${0})/utilities"
+
+# Use the test prologue for sanity checks
+ft-prologue "${@}"
+
+# Initialize test, launch the LTRX and begin processing
+ft-setup "${@}"
+
+
+# check output
+ft-check wait-for-file "medias/output/Mormons_ads.ts.encrypted" "15"
+
+logmsg "decrypting our ts output with openssl"
+openssl enc -d -aes-256-cbc -in medias/output/Mormons_ads.ts.encrypted -out medias/output/Mormons_ads.ts.decrypted -K ${KEY} -iv ${IV}
+
+logmsg "basic analysis of the decrypted file"
+# NOTE : The latest analyser can decrypt. but all nodes will need to be updated (so we decrypt with openssl)
+analyser "medias/output/Mormons_ads.ts.decrypted" &> "medias/output/analysis.txt"
+
+logmsg "check if file type is ContentType video/mpegts"
+ft-check grep --quiet "ContentType video/mpegts" "medias/output/analysis.txt"
+
+logmsg "TEST GOOD!"
+
+# Checks are complete, terminate the test and cleanup
+ft-teardown

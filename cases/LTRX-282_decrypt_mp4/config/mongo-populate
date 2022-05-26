@@ -1,0 +1,109 @@
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+
+var timestamp = "$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+var target = [
+{
+   "_id": name,
+   "name": name,
+   "type": "file",
+   "mime": "video/mp4",
+   "url": "file://output/Mormons_ads.mp4.decrypted",
+   "timestamp": timestamp,
+   "mediaProfile":
+    {
+        "_id": "pt",
+        "name": "pt",
+        "audio": [
+            {
+            "trackId": "98",
+            "codec": "audio/aac",
+            "bitrate": "64000"
+            }
+        ],
+        "video": [
+            {
+            "trackId": "96",
+            "codec": "video/h264",
+            "bitrate": "150000",
+            "framerate": "15/1",
+            "handler": "software",
+            "transcode": "false",
+            "kfs": "2000",
+            "width": 160,
+            "height": 120,
+            }
+        ],
+        "timestamp": timestamp
+    }
+}
+];
+
+db.targets.insert (target);
+
+
+var source = [
+    {
+       "_id" : name,
+       "name" : name,
+       "timestamp" : timestamp,
+       "type" : "file",
+       "url" : "file://Mormons_ads.mp4.encrypted",
+       "drm" : 
+        {
+            "original_mime" : "image/png",
+            "type" : "oracle",
+            "oracle" : 
+            {
+                "tenancy_id" : "ocid1.tenancy.oc1..aaaaaaaatzlccjqy5awi2nyminxaecy4is2glvhd54gxq4tonsgspzolo7za",
+                "user_id" : "ocid1.user.oc1..aaaaaaaahmmhmo6whlsdlou5lsijaukhfe5lr64vkbjvnul4esnfhzd2lo3a",
+                "master_key_id" : "ocid1.key.oc1.ca-montreal-1.dvq56alqaahfw.ab4xkljrercqfvro44t45dti5pigidxb3433fiyhnrxzajp23qlkd6v5uq6q",
+                "crypto_endpoint" : "dvq56alqaahfw-crypto.kms.ca-montreal-1.oraclecloud.com",
+                "cipher_encryption_key" : "QS45CE/czQVcAEHm66374MiKMz9uzrZ6AI0gzkYjTqNACxUevLtJoaeV8vsWehaLsJwWEDcjAAAAAA==",
+                "NOTE" : "By Providing the encryption_key below, the code won't try to get it from Oracle. This is for debug purpose",
+                "encryption_iv" : "000102030405060708090A0B0C0D0E0F",
+                "encryption_key" : "000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F",
+                "cypher" : "aes-256-cbc",
+                "api_pem_key" : "-----BEGIN PRIVATE KEY-----\n THIS IS NOT A REAL API KEY \n-----END PRIVATE KEY-----"
+            }
+        }
+    }
+];
+
+db.sources.insert (source);
+
+
+var service = [
+{
+  "_id": name,
+  "name": name,
+  "timestamp": timestamp,
+  "group": "default",
+  "type": "default",
+  "scope": "offline",
+  "control": "enabled",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name,
+  }
+}
+,
+];
+
+db.services.insert (service);
+
+
+EOS
+
+: ${MONGODB_URL:="ltrx"}
+#mongo ${MONGODB_URL} config/mongo-populate.js

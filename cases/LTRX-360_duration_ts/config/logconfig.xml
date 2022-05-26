@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE log4cxx:configuration SYSTEM "log4cxx.dtd">
+<!-- If you wish to show the debug information when this configuration is -->
+<!-- loaded set debug to true. -->
+<configuration debug="false">
+  <!-- This appender sends messages directly to the console -->
+  <appender name="syslog" class="org.apache.log4j.ConsoleAppender">
+    <param name="Target" value="System.out"/>
+    <layout class="org.apache.log4j.PatternLayout">
+      <param name="ConversionPattern" value="%6rms | %-7p | %50c - %m%n"/>
+    </layout>
+  </appender>
+  <appender name="filelog" class="org.apache.log4j.net.FileAppender">
+    <param name="File" value="${LTRX_LOG}"/>
+    <layout class="org.apache.log4j.PatternLayout">
+      <param name="ConversionPattern" value="%6rms | %-7p | %50c - %m%n"/>
+    </layout>
+  </appender>
+  <root>
+    <!-- Sets the default logging level for the appenders -->
+    <!-- Note: the class is required to be able to use the Vantrix customised -->
+    <!-- Other logging levels: ALL, VERBOSE, PRIVATE, DEBUG, INFO, WARNING, ERROR, FATAL -->
+    <priority value="ALL" class="cVanLogLevel"/>
+    <appender-ref ref="syslog"/>
+    <appender-ref ref="filelog"/>
+  </root>
+</configuration>

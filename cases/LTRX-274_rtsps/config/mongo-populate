@@ -1,0 +1,120 @@
+#!/bin/bash
+
+cat > config/mongo-populate.js << EOS
+var timestamp = "$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")";
+var name = "ft";
+
+db.dropAllUsers ();
+db.dropDatabase ();
+
+var profile = [
+{
+  "_id": name+"-rtsp-out",
+  "name": name+"-rtsp-out",
+  "timestamp": timestamp,
+  "audio" : [ 
+     {
+         "codec" : "audio/aac",
+         "bitrate" : "128000",
+         "channelMode" : "stereo",
+         "samplingRate" : "48000",
+         "sbr" : "false",
+         "trackId" : "21"
+     }
+  ],
+  "video": [
+     {
+         "trackId" : "31",
+         "codec" : "video/h264",
+         "bitrate" : "3000000",
+         "width" : "1920",
+         "height" : "1080",
+         "kfs" : "2000",
+         "framerate" : "20 / 1",
+         "allowUpsampling" : "false",
+         "scalingMethod" : "preserve",
+         "handler" : "software",
+         "transcode" : "false",
+         "encoderParams" : "scaling-algo=bicubic profile=high bframes=2 keyint-mode=frame keyint=20 keyint-abs=20"
+     }
+  ]
+}
+];
+
+db.profiles.insert (profile);
+
+
+var target = [
+{
+  "_id": name+"-rtsp-out",
+  "name": name+"-rtsp-out",
+  "type": "rtsp",
+  "url": "rtsps://127.0.0.1:8555/mystream",
+  "advancedParams": "protocol=tcp tls-validation-flags=generic-error",
+  "mediaProfile": {
+    "\$ref": "profiles",
+    "\$id": name+"-rtsp-out",
+  }
+}
+];
+
+db.targets.insert (target);
+
+
+var source = [
+{
+   "_id" : name+"-rtsp-out",
+   "name" : name+"-rtsp-out",
+   "timestamp" : timestamp,
+   "type" : "file",
+   "url" : "file://Avril_Lavigne_-_What_The_Hell_1920x1080.mp4",
+   "video" : [
+      {
+         "index": "400"
+      }
+   ],
+   "audio" : [ 
+      {
+         "index": "200"
+      }
+    ]
+}
+];
+
+db.sources.insert (source);
+
+
+var service = [
+{
+  "_id": name+"-rtsp-out",
+  "name": name+"-rtsp-out",
+  "timestamp": timestamp,
+  "group": "default",
+  "type": "default",
+  "scope": "offline",
+  "control": "enabled",
+  "sourceMediaDefinition": [{
+      "\$ref": "sources",
+      "\$id": name+"-rtsp-out"
+  }],
+  "targetMediaDefinition": {
+    "\$ref": "targets",
+    "\$id": name+"-rtsp-out",
+  }
+}
+];
+
+db.services.insert (service);
+
+
+var operation = [];
+
+db.operations.video.insert (operation);
+
+
+
+EOS
+
+: ${MONGODB_URL:="ltrx"}
+#mongo ${MONGODB_URL} config/mongo-populate.js
+
