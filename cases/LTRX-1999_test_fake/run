@@ -1,0 +1,6 @@
+#!/bin/bash
+
+echo "TEST RUN!!!! This is new test in branch"
+sleep 3
+echo "TEST exit THIS test WILL FAIL"
+exit -1
