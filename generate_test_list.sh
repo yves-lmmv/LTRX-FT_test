@@ -1,7 +1,26 @@
 #!/bin/bash
 rm list.txt -f
-echo "LTRX-111_test_fake" > list.txt
-echo "LTRX-112_test_fake" >> list.txt
-echo "LTRX-11234" >> list.txt
-echo "LTRX-10000" >> list.txt
-echo "LTRX-10011" >> list.txt
+
+#./generate_test_list.sh
+
+
+
+for dir in cases/*/     # list directories in the form "/tmp/dirname/"
+do
+    dir=${dir%*/}      # remove the trailing "/"
+    #echo "dir is ${dir##*/}"    # print everything after the final "/"
+    pushd "${dir}"
+    lDesact=""
+    lLabel=""
+    grep -q "#DESAC" run
+    if [[ $? -eq 0 ]]
+    then
+    	lDesact="DESAC"
+    fi
+
+    lLabel=`awk -F"#LABEL:" '/#LABEL:/{print $2}' run`
+    popd
+    echo "${dir##*/}, ${lDesact}, ${lLabel}" >> list.txt
+
+done
+

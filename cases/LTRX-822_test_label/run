@@ -1,0 +1,8 @@
+#!/bin/bash
+
+#LABEL:(MSS||OPT-MSS)&&skylake
+
+echo "TEST RUN!!!!"
+sleep 3
+echo "TEST exit"
+exit 0
