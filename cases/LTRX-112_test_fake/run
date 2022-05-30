@@ -1,5 +1,8 @@
 #!/bin/bash
 
+
+#LABEL:BASETEST
+
 echo "TEST RUN!!!!"
 sleep 3
 echo "TEST exit"
