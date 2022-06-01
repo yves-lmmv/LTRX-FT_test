@@ -1,0 +1,9 @@
+#!/bin/bash
+
+
+#LABEL:UBUNTU-FAIL
+
+echo "TEST RUN!!!!"
+sleep 3
+echo "TEST exit"
+exit 0
